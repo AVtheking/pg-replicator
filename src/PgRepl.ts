@@ -41,9 +41,48 @@ export enum CopyDataCode {
     XLogData = "w",
 }
 
+type CopyData =
+    | {
+        readonly _tag: "keepalive"
+        readonly serverWalEnd: bigint
+        readonly serverTime: bigint
+        readonly replyRequested: boolean
+    }
+    | {
+        readonly _tag: "xLogData"
+        readonly serverWalStart: bigint
+        readonly serverWalEnd: bigint
+        readonly serverTime: bigint
+        readonly walData: Buffer
+    }
 
+type PgOutput =
+    | {
+        _tag: "keepalive"
+        serverWalEnd: bigint
+        serverTime: bigint
+        replyRequested: boolean
+    }
+    | {
+        _tag: "BEGIN"
+        finalLSN: bigint
+        commitTimestamp: bigint
+        xid: number
+    }
+    | {
+        _tag: "INSERT"
+        xid: number
+        tableOid: number
+        tupleDataMessage: bigint
+        tupleData: Buffer
+    }
+    | {
+        _tag: "UNKNOWN"
+        type: string
+        walData: Buffer
+    }
 
-const decodeCopyData = (chunk: Buffer) => {
+const decodeCopyData = (chunk: Buffer): CopyData => {
     const code = String.fromCharCode(chunk[0])
     switch (code) {
         case CopyDataCode.Keepalive:
@@ -66,9 +105,49 @@ const decodeCopyData = (chunk: Buffer) => {
     }
 }
 
+
+const decodePgOutput = (copyData: CopyData): Effect.Effect<PgOutput, PgReplError, never> => {
+    switch (copyData._tag) {
+        case "keepalive":
+            return Effect.succeed({
+                _tag: "keepalive",
+                serverWalEnd: copyData.serverWalEnd,
+                serverTime: copyData.serverTime,
+                replyRequested: copyData.replyRequested
+            })
+        case "xLogData":
+            const walData = copyData.walData
+            const firstByte = String.fromCharCode(walData[0])
+            switch (firstByte) {
+                case "B":
+                    return Effect.succeed({
+                        _tag: "BEGIN",
+                        finalLSN: walData.readBigUInt64BE(1),
+                        commitTimestamp: walData.readBigUInt64BE(9),
+                        xid: walData.readUInt32BE(17),
+                    })
+                case "I":
+                    return Effect.succeed({
+                        _tag: "INSERT",
+                        xid: walData.readUInt32BE(1),
+                        tableOid: walData.readUInt32BE(5),
+                        tupleDataMessage: walData.readBigUInt64BE(9),
+                        tupleData: walData.subarray(10)
+
+                    })
+                default:
+                    return Effect.logInfo("Not implemented this byte: " + firstByte).pipe(
+                        Effect.as({ _tag: "UNKNOWN", type: firstByte, walData: walData })
+                    )
+            }
+    }
+}
+
+
+
 export interface PgRepl {
     createReplicationSlot(option: CreateReplicationSlot): Effect.Effect<CreateReplicationSlotResult, PgReplError, never>
-    startReplication(option: StartReplicationOption): Stream.Stream<ReturnType<typeof decodeCopyData>, PgReplError>
+    startReplication(option: StartReplicationOption): Stream.Stream<PgOutput, PgReplError>
 }
 
 export const fromPg = (client: pg.Client): PgRepl => {
@@ -144,7 +223,8 @@ export const fromPg = (client: pg.Client): PgRepl => {
                     //not awaited
                     client.query(sql).catch((error) => Queue.failCauseUnsafe(queue, Cause.fail(new PgReplError({ message: `command failed : ${sql}`, cause: error }))))
                 })
-            }).pipe(Stream.map(decodeCopyData))
+            }).pipe(Stream.map(decodeCopyData),
+                Stream.mapEffect((copyData) => decodePgOutput(copyData)))
     }
 }
 

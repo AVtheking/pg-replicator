@@ -36,9 +36,18 @@ const RunReplication = Effect.fn(function* () {
         protoVersion: 2,
     }).pipe(
         // Raw CopyData payloads for now: first byte is 'w' (XLogData) or 'k' (keepalive).
-        Stream.runForEach((chunk) =>
-            Effect.logInfo(`${chunk._tag} ${chunk.serverWalStart} ${chunk.walData} bytes`)
-        )
+        Stream.runForEach((chunk) => {
+            if (chunk._tag === "keepalive") {
+                return Effect.logInfo(`keepalive ${chunk.serverWalEnd} ${chunk.serverTime} ${chunk.replyRequested}`)
+            }
+            if (chunk._tag === "BEGIN") {
+                return Effect.logInfo(`BEGIN ${chunk.finalLSN} ${chunk.commitTimestamp} ${chunk.xid}`)
+            }
+            if (chunk._tag === "INSERT") {
+                return Effect.logInfo(`INSERT ${chunk.xid} ${chunk.tableOid} ${chunk.tupleData.length} bytes`)
+            }
+            return Effect.void
+        })
     )
 })
 
