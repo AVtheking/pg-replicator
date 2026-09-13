@@ -36,9 +36,39 @@ export interface StartReplicationOption {
     mode?: ReplicationMode
 }
 
+export enum CopyDataCode {
+    Keepalive = "k",
+    XLogData = "w",
+}
+
+
+
+const decodeCopyData = (chunk: Buffer) => {
+    const code = String.fromCharCode(chunk[0])
+    switch (code) {
+        case CopyDataCode.Keepalive:
+            return {
+                _tag: "keepalive",
+                serverWalEnd: chunk.readBigUInt64BE(1),
+                serverTime: chunk.readBigUInt64BE(9),
+                replyRequested: chunk[17] !== 0
+            }
+        case CopyDataCode.XLogData:
+            return {
+                _tag: "xLogData",
+                serverWalStart: chunk.readBigUInt64BE(1),
+                serverWalEnd: chunk.readBigUInt64BE(9),
+                serverTime: chunk.readBigUInt64BE(17),
+                walData: chunk.subarray(25)
+            }
+        default:
+            throw new PgReplError({ message: `unknown copy data code: ${code}`, cause: chunk })
+    }
+}
+
 export interface PgRepl {
     createReplicationSlot(option: CreateReplicationSlot): Effect.Effect<CreateReplicationSlotResult, PgReplError, never>
-    startReplication(option: StartReplicationOption): Stream.Stream<Buffer, PgReplError>
+    startReplication(option: StartReplicationOption): Stream.Stream<ReturnType<typeof decodeCopyData>, PgReplError>
 }
 
 export const fromPg = (client: pg.Client): PgRepl => {
@@ -114,8 +144,7 @@ export const fromPg = (client: pg.Client): PgRepl => {
                     //not awaited
                     client.query(sql).catch((error) => Queue.failCauseUnsafe(queue, Cause.fail(new PgReplError({ message: `command failed : ${sql}`, cause: error }))))
                 })
-
-            })
+            }).pipe(Stream.map(decodeCopyData))
     }
 }
 

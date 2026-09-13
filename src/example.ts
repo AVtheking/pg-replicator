@@ -37,7 +37,7 @@ const RunReplication = Effect.fn(function* () {
     }).pipe(
         // Raw CopyData payloads for now: first byte is 'w' (XLogData) or 'k' (keepalive).
         Stream.runForEach((chunk) =>
-            Effect.logInfo(`${String.fromCharCode(chunk[0])} ${chunk.length} bytes`)
+            Effect.logInfo(`${chunk._tag} ${chunk.serverWalStart} ${chunk.walData} bytes`)
         )
     )
 })
