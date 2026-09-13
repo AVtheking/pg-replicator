@@ -56,11 +56,11 @@ type CopyData =
         readonly walData: Buffer
     }
 
-type Column = {
-    dataType: string
-    length: number
-    data: Uint8Array
-}
+type Column =
+    | { dataType: "null" }
+    | { dataType: "toast" }
+    | { dataType: "text", value: string }
+    | { dataType: "binary", value: Uint8Array }
 
 type TupleData = {
     numberOfColumns: number
@@ -119,16 +119,24 @@ const decodeTupleData = (tupleData: Buffer): TupleData => {
     const numberOfColumns = tupleData.readUInt16BE(offset)
     offset += 2
 
-    const columns = numberOfColumns === 0 ? [] : Array.makeBy<Column>(numberOfColumns, (i) => {
+    const columns = numberOfColumns === 0 ? [] : Array.makeBy<Column>(numberOfColumns, () => {
         const dataType = String.fromCharCode(tupleData[offset++])
         const length = tupleData.readUInt32BE(offset)
         offset += 4
         const data = tupleData.subarray(offset, offset + length)
-        offset += length
-        return {
-            dataType,
-            length,
-            data
+        switch (dataType) {
+            case "n":
+                return { dataType: "null" }
+            case "u":
+                return { dataType: "toast" }
+            case "t":
+                offset += length
+                return { dataType: "text", value: data.toString("utf-8") }
+            case "b":
+                offset += length
+                return { dataType: "binary", value: data }
+            default:
+                throw new PgReplError({ message: `unknown data type: ${dataType}` })
         }
     })
 

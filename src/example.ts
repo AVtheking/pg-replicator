@@ -44,7 +44,18 @@ const RunReplication = Effect.fn(function* () {
                 return Effect.logInfo(`BEGIN ${chunk.finalLSN} ${chunk.commitTimestamp} ${chunk.xid}`)
             }
             if (chunk._tag === "INSERT") {
-                return Effect.logInfo(`INSERT ${chunk.relationId} ${chunk.tupleData.numberOfColumns} columns ${chunk.tupleData.columns.map((column) => `${column.dataType} ${column.length} bytes`).join(", ")}`)
+                return Effect.forEach(chunk.tupleData.columns, (column) => {
+                    switch (column.dataType) {
+                        case "text":
+                            return Effect.logInfo(`INSERT text ${chunk.relationId} ${column.value}`)
+                        case "binary":
+                            return Effect.logInfo(`INSERT binary ${chunk.relationId} ${Buffer.from(column.value).toString("utf-8")}`)
+                        case "null":
+                            return Effect.logInfo(`INSERT null ${chunk.relationId}`)
+                        case "toast":
+                            return Effect.logInfo(`INSERT toast ${chunk.relationId}`)
+                    }
+                }, { discard: true })
             }
             return Effect.void
         })
