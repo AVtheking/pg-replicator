@@ -1,5 +1,4 @@
-import { Data, Effect, Stream } from "effect"
-import { SqlClient } from "effect/unstable/sql"
+import { Cause, Data, Effect, Queue, Stream } from "effect"
 import pg from "pg"
 
 export class PgReplError extends Data.TaggedError("PgReplError")<{
@@ -34,11 +33,12 @@ export interface StartReplicationOption {
     startLSN: string
     publication: string
     protoVersion: number
+    mode?: ReplicationMode
 }
 
 export interface PgRepl {
     createReplicationSlot(option: CreateReplicationSlot): Effect.Effect<CreateReplicationSlotResult, PgReplError, never>
-    startReplication(option: StartReplicationOption): Stream.Stream<any, never, never>
+    startReplication(option: StartReplicationOption): Stream.Stream<Buffer, PgReplError>
 }
 
 export const fromPg = (client: pg.Client): PgRepl => {
@@ -71,11 +71,51 @@ export const fromPg = (client: pg.Client): PgRepl => {
 
         }),
 
-        startReplication: (option: StartReplicationOption) => {
-            return Stream.die("Not implemented")
+        startReplication: (option: StartReplicationOption) =>
+            Stream.callback<Buffer, PgReplError>((queue) => {
+                return Effect.gen(function* () {
 
-        }
+                    const onCopyData = (msg: { chunk: Buffer }) => {
+                        Queue.offerUnsafe(queue, msg.chunk)
+                    }
+
+                    const onCopyDone = () => {
+                        Queue.endUnsafe(queue)
+                    }
+
+                    const onError = (error: Error) => {
+                        console.error(error)
+                        Queue.failCauseUnsafe(queue, Cause.fail(new PgReplError({ message: `connection error`, cause: error })))
+                    }
+                    const onEnd = () => {
+                        Queue.endUnsafe(queue)
+                    }
+
+                    client.connection.on("copyData", onCopyData)
+                    client.connection.on("copyDone", onCopyDone)
+                    client.connection.on("error", onError)
+                    client.connection.on("end", onEnd)
+                    client.on("error", onError)
+
+                    yield* Effect.addFinalizer(() =>
+                        Effect.sync(() => {
+                            client.connection.off("copyData", onCopyData)
+                            client.connection.off("copyDone", onCopyDone)
+                            client.connection.off("error", onError)
+                            client.connection.off("end", onEnd)
+                            client.off("error", onError)
+                        })
+                    )
+
+                    const mode = option.mode ? option.mode : "LOGICAL"
+
+                    const sql = `START_REPLICATION SLOT ${option.slot} ${mode} ${option.startLSN} (proto_version '${option.protoVersion}', publication_names '${option.publication}')`
+
+                    //not awaited
+                    client.query(sql).catch((error) => Queue.failCauseUnsafe(queue, Cause.fail(new PgReplError({ message: `command failed : ${sql}`, cause: error }))))
+                })
+
+            })
     }
-
-
 }
+

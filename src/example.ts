@@ -1,49 +1,48 @@
 import { Effect, Stream } from "effect"
 import pg from "pg"
 import * as PgRepl from "./PgRepl"
-import { NodeRuntime, NodeSocket } from "@effect/platform-node"
+import { NodeRuntime } from "@effect/platform-node"
 
-const connectionString = "postgres://postgres:postgres@localhost:5434/syncengine?replication=database"
+const connectionString = "postgres://postgres:postgres@localhost:5434/syncengine"
 const slotName = "my_slot"
 const publicationName = "sync_pub"
 const outputPlugin = "pgoutput"
 
 
 const RunReplication = Effect.fn(function* () {
-    const connection = yield* Effect.promise(async () => {
-        const connection = new pg.Client({
-            connectionString,
-        })
-        await connection.connect()
-        return connection
-    })
+    // replication: "database" is what turns this into a walsender connection.
+    // @types/pg doesn't declare the field, but the pg runtime reads it.
+    const connection = yield* Effect.acquireRelease(
+        Effect.promise(async () => {
+            const connection = new pg.Client({
+                connectionString,
+                replication: "database",
+            } as pg.ClientConfig)
+            await connection.connect()
+            return connection
+        }),
+        (connection) => Effect.promise(() => connection.end())
+    )
 
     const repl = PgRepl.fromPg(connection)
 
-    yield* repl.createReplicationSlot({ slotName, outputPlugin, options: { temporary: true } })
+    const slot = yield* repl.createReplicationSlot({ slotName, outputPlugin, options: { temporary: true } })
+    yield* Effect.logInfo(`slot ${slot.name} created at ${slot.consistentPoint}`)
 
-    yield* repl.startReplication({ slot: slotName, startLSN: "0/0", publication: publicationName, protoVersion: 3 }).pipe(
-        Stream.runForEach((event) => {
-            switch (event._tag) {
-                case "Begin": return Effect.logInfo(`BEGIN xid=${event.xid}`)
-                case "Insert": return Effect.logInfo(`INSERT ${event.relation.namespace}.${event.relation.name}`, event.row)
-                case "Update": return Effect.logInfo(`UPDATE ${event.relation.name}`, event.old, event.new)
-                case "Delete": return Effect.logInfo(`DELETE ${event.relation.name}`, event.old)
-                case "Commit": return Effect.logInfo(`COMMIT lsn=${event.commitLsn}`)
-                default: return Effect.logInfo(event._tag)
-            }
-        })
+    yield* repl.startReplication({
+        slot: slot.name,
+        startLSN: slot.consistentPoint,
+        publication: publicationName,
+        protoVersion: 2,
+    }).pipe(
+        // Raw CopyData payloads for now: first byte is 'w' (XLogData) or 'k' (keepalive).
+        Stream.runForEach((chunk) =>
+            Effect.logInfo(`${String.fromCharCode(chunk[0])} ${chunk.length} bytes`)
+        )
     )
-
-
 })
 
-const program = Effect.gen(function* () {
-    yield* RunReplication()
-})
-
-program.pipe(
+RunReplication().pipe(
     Effect.scoped,
-    Effect.provide(NodeSocket.layerNet({ host: "localhost", port: 5434 })),
     NodeRuntime.runMain
 )
