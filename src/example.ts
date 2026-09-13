@@ -44,7 +44,7 @@ const RunReplication = Effect.fn(function* () {
                 return Effect.logInfo(`BEGIN ${chunk.finalLSN} ${chunk.commitTimestamp} ${chunk.xid}`)
             }
             if (chunk._tag === "INSERT") {
-                return Effect.logInfo(`INSERT ${chunk.xid} ${chunk.tableOid} ${chunk.tupleData.length} bytes`)
+                return Effect.logInfo(`INSERT ${chunk.relationId} ${chunk.tupleData.numberOfColumns} columns ${chunk.tupleData.columns.map((column) => `${column.dataType} ${column.length} bytes`).join(", ")}`)
             }
             return Effect.void
         })

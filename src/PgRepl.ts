@@ -1,4 +1,4 @@
-import { Cause, Data, Effect, Queue, Stream } from "effect"
+import { Cause, Data, Effect, Queue, Stream, Array } from "effect"
 import pg from "pg"
 
 export class PgReplError extends Data.TaggedError("PgReplError")<{
@@ -56,6 +56,17 @@ type CopyData =
         readonly walData: Buffer
     }
 
+type Column = {
+    dataType: string
+    length: number
+    data: Uint8Array
+}
+
+type TupleData = {
+    numberOfColumns: number
+    columns: Column[]
+}
+
 type PgOutput =
     | {
         _tag: "keepalive"
@@ -71,37 +82,59 @@ type PgOutput =
     }
     | {
         _tag: "INSERT"
-        xid: number
-        tableOid: number
-        tupleDataMessage: bigint
-        tupleData: Buffer
+        relationId: number
+        tupleData: TupleData
     }
     | {
         _tag: "UNKNOWN"
         type: string
-        walData: Buffer
+        walData: Uint8Array
     }
 
-const decodeCopyData = (chunk: Buffer): CopyData => {
+const decodeCopyData = (chunk: Buffer): Effect.Effect<CopyData, PgReplError, never> => {
     const code = String.fromCharCode(chunk[0])
     switch (code) {
         case CopyDataCode.Keepalive:
-            return {
+            return Effect.succeed({
                 _tag: "keepalive",
                 serverWalEnd: chunk.readBigUInt64BE(1),
                 serverTime: chunk.readBigUInt64BE(9),
                 replyRequested: chunk[17] !== 0
-            }
+            })
         case CopyDataCode.XLogData:
-            return {
+            return Effect.succeed({
                 _tag: "xLogData",
                 serverWalStart: chunk.readBigUInt64BE(1),
                 serverWalEnd: chunk.readBigUInt64BE(9),
                 serverTime: chunk.readBigUInt64BE(17),
                 walData: chunk.subarray(25)
-            }
+            })
         default:
-            throw new PgReplError({ message: `unknown copy data code: ${code}`, cause: chunk })
+            return Effect.fail(new PgReplError({ message: `unknown copy data code: ${code}`, cause: chunk }))
+    }
+}
+
+const decodeTupleData = (tupleData: Buffer): TupleData => {
+    let offset = 0
+    const numberOfColumns = tupleData.readUInt16BE(offset)
+    offset += 2
+
+    const columns = numberOfColumns === 0 ? [] : Array.makeBy<Column>(numberOfColumns, (i) => {
+        const dataType = String.fromCharCode(tupleData[offset++])
+        const length = tupleData.readUInt32BE(offset)
+        offset += 4
+        const data = tupleData.subarray(offset, offset + length)
+        offset += length
+        return {
+            dataType,
+            length,
+            data
+        }
+    })
+
+    return {
+        numberOfColumns,
+        columns
     }
 }
 
@@ -127,12 +160,13 @@ const decodePgOutput = (copyData: CopyData): Effect.Effect<PgOutput, PgReplError
                         xid: walData.readUInt32BE(17),
                     })
                 case "I":
+                    if (String.fromCharCode(walData[5]) !== "N") {
+                        return Effect.fail(new PgReplError({ message: "INSERT: expected 'N' tuple" }))
+                    }
                     return Effect.succeed({
                         _tag: "INSERT",
-                        xid: walData.readUInt32BE(1),
-                        tableOid: walData.readUInt32BE(5),
-                        tupleDataMessage: walData.readBigUInt64BE(9),
-                        tupleData: walData.subarray(10)
+                        relationId: walData.readUInt32BE(1),
+                        tupleData: decodeTupleData(walData.subarray(6))
 
                     })
                 default:
@@ -223,8 +257,8 @@ export const fromPg = (client: pg.Client): PgRepl => {
                     //not awaited
                     client.query(sql).catch((error) => Queue.failCauseUnsafe(queue, Cause.fail(new PgReplError({ message: `command failed : ${sql}`, cause: error }))))
                 })
-            }).pipe(Stream.map(decodeCopyData),
-                Stream.mapEffect((copyData) => decodePgOutput(copyData)))
+            }).pipe(Stream.mapEffect(decodeCopyData),
+                Stream.mapEffect(decodePgOutput))
     }
 }
 
