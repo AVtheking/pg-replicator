@@ -43,6 +43,9 @@ const RunReplication = Effect.fn(function* () {
             if (chunk._tag === "BEGIN") {
                 return Effect.logInfo(`BEGIN ${chunk.finalLSN} ${chunk.commitTimestamp} ${chunk.xid}`)
             }
+            if (chunk._tag === "RELATION") {
+                return Effect.logInfo(`RELATION ${chunk.relationId} ${chunk.namespace} ${chunk.name} ${chunk.replicaIdentity} ${chunk.numberOfColumns}`)
+            }
             if (chunk._tag === "INSERT") {
                 return Effect.forEach(chunk.tupleData.columns, (column) => {
                     switch (column.dataType) {

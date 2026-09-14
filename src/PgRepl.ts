@@ -67,6 +67,23 @@ type TupleData = {
     columns: Column[]
 }
 
+type RelationColumn = {
+    flag: number
+    name: string
+    dataTypeOID: number
+    dataTypeModifier: number
+}
+
+type RelationData = {
+    relationId: number
+    namespace: string
+    name: string
+    replicaIdentity: number
+    numberOfColumns: number
+    relationColumns: RelationColumn[]
+}
+
+
 type PgOutput =
     | {
         _tag: "keepalive"
@@ -79,6 +96,15 @@ type PgOutput =
         finalLSN: bigint
         commitTimestamp: bigint
         xid: number
+    }
+    | {
+        _tag: "RELATION"
+        relationId: number
+        namespace: string
+        name: string
+        replicaIdentity: number
+        numberOfColumns: number
+        relationColumns: RelationColumn[]
     }
     | {
         _tag: "INSERT"
@@ -146,6 +172,44 @@ const decodeTupleData = (tupleData: Buffer): TupleData => {
     }
 }
 
+const readCString = (buf: Buffer, offset: number): [string, number] => {
+    const end = buf.indexOf(0, offset)
+    const string = buf.toString("utf-8", offset, end)
+    return [string, end + 1]
+}
+
+const decodeRelatioData = (relationData: Buffer): RelationData => {
+    let offset = 0
+    const relationId = relationData.readUInt32BE(offset)
+    offset += 4
+    const [namespace, namespaceLen] = readCString(relationData, offset)
+    offset = namespaceLen
+
+    const [name, nameLen] = readCString(relationData, offset)
+    offset = nameLen
+
+    const replicaIdentity = String.fromCharCode(relationData[offset++])
+    const numberOfColumns = relationData.readUInt16BE(offset)
+    offset += 2
+
+    const columns = numberOfColumns === 0 ? [] : Array.makeBy<RelationColumn>(numberOfColumns, () => {
+        const flag = String.fromCharCode(relationData[offset++])
+        const [name, columnNameLen] = readCString(relationData, offset)
+        offset = columnNameLen
+
+        const dataTypeOID = relationData.readUInt32BE(offset)
+        offset += 4
+
+        const dataTypeModifier = relationData.readUInt32BE(offset)
+        offset += 4
+
+        return { flag: Number(flag), name, dataTypeOID, dataTypeModifier }
+    })
+
+    return { relationId, namespace, name, replicaIdentity: Number(replicaIdentity), numberOfColumns, relationColumns: columns }
+
+}
+
 
 const decodePgOutput = (copyData: CopyData): Effect.Effect<PgOutput, PgReplError, never> => {
     switch (copyData._tag) {
@@ -160,6 +224,11 @@ const decodePgOutput = (copyData: CopyData): Effect.Effect<PgOutput, PgReplError
             const walData = copyData.walData
             const firstByte = String.fromCharCode(walData[0])
             switch (firstByte) {
+                case "R":
+                    return Effect.succeed({
+                        _tag: "RELATION",
+                        ...decodeRelatioData(walData.subarray(1))
+                    })
                 case "B":
                     return Effect.succeed({
                         _tag: "BEGIN",
