@@ -36,7 +36,7 @@ const RunReplication = Effect.fn(function* () {
         protoVersion: 2,
     }).pipe(
         Stream.runForEach(PgOutput.$match({
-            keepalive: (k) =>
+            Keepalive: (k) =>
                 Effect.logInfo(`keepalive ${k.serverWalEnd} ${k.serverTime} ${k.replyRequested}`),
             Begin: (b) =>
                 Effect.logInfo(`BEGIN ${b.finalLSN} ${b.commitTimestamp} ${b.xid}`),
