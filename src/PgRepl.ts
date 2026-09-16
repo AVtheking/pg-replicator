@@ -1,4 +1,4 @@
-import { Cause, Data, Effect, Queue, Stream, Array } from "effect"
+import { Cause, Data, Effect, Queue, Stream, Array, Match } from "effect"
 import pg from "pg"
 
 export class PgReplError extends Data.TaggedError("PgReplError")<{
@@ -41,26 +41,30 @@ export enum CopyDataCode {
     XLogData = "w",
 }
 
-type CopyData =
-    | {
-        readonly _tag: "keepalive"
-        readonly serverWalEnd: bigint
-        readonly serverTime: bigint
-        readonly replyRequested: boolean
+export type CopyData = Data.TaggedEnum<{
+    Keepalive: {
+        serverWalEnd: bigint
+        serverTime: bigint
+        replyRequested: boolean
     }
-    | {
-        readonly _tag: "xLogData"
-        readonly serverWalStart: bigint
-        readonly serverWalEnd: bigint
-        readonly serverTime: bigint
-        readonly walData: Buffer
+    XLogData: {
+        serverWalStart: bigint
+        serverWalEnd: bigint
+        serverTime: bigint
+        walData: Buffer
     }
+}>
 
-type Column =
-    | { dataType: "null" }
-    | { dataType: "toast" }
-    | { dataType: "text", value: string }
-    | { dataType: "binary", value: Uint8Array }
+export const CopyData = Data.taggedEnum<CopyData>()
+
+export type Column = Data.TaggedEnum<{
+    Null: {}
+    Toast: {}
+    Text: { value: string }
+    Binary: { value: Uint8Array }
+}>
+
+export const Column = Data.taggedEnum<Column>()
 
 type TupleData = {
     numberOfColumns: number
@@ -68,7 +72,7 @@ type TupleData = {
 }
 
 type RelationColumn = {
-    flag: number
+    flag: string
     name: string
     dataTypeOID: number
     dataTypeModifier: number
@@ -78,63 +82,60 @@ type RelationData = {
     relationId: number
     namespace: string
     name: string
-    replicaIdentity: number
+    replicaIdentity: string
     numberOfColumns: number
     relationColumns: RelationColumn[]
 }
 
-
-type PgOutput =
-    | {
-        _tag: "keepalive"
+export type PgOutput = Data.TaggedEnum<{
+    keepalive: {
         serverWalEnd: bigint
         serverTime: bigint
         replyRequested: boolean
     }
-    | {
-        _tag: "BEGIN"
+    Begin: {
         finalLSN: bigint
         commitTimestamp: bigint
         xid: number
     }
-    | {
-        _tag: "RELATION"
+    Relation: {
         relationId: number
         namespace: string
         name: string
-        replicaIdentity: number
+        replicaIdentity: string
         numberOfColumns: number
         relationColumns: RelationColumn[]
     }
-    | {
-        _tag: "INSERT"
+    Insert: {
         relationId: number
         tupleData: TupleData
     }
-    | {
-        _tag: "UNKNOWN"
+    Unknown: {
         type: string
-        walData: Uint8Array
+        walData: Buffer
     }
+}>
+
+export const PgOutput = Data.taggedEnum<PgOutput>()
+
+
 
 const decodeCopyData = (chunk: Buffer): Effect.Effect<CopyData, PgReplError, never> => {
     const code = String.fromCharCode(chunk[0])
     switch (code) {
         case CopyDataCode.Keepalive:
-            return Effect.succeed({
-                _tag: "keepalive",
+            return Effect.succeed(CopyData.Keepalive({
                 serverWalEnd: chunk.readBigUInt64BE(1),
                 serverTime: chunk.readBigUInt64BE(9),
                 replyRequested: chunk[17] !== 0
-            })
+            }))
         case CopyDataCode.XLogData:
-            return Effect.succeed({
-                _tag: "xLogData",
+            return Effect.succeed(CopyData.XLogData({
                 serverWalStart: chunk.readBigUInt64BE(1),
                 serverWalEnd: chunk.readBigUInt64BE(9),
                 serverTime: chunk.readBigUInt64BE(17),
                 walData: chunk.subarray(25)
-            })
+            }))
         default:
             return Effect.fail(new PgReplError({ message: `unknown copy data code: ${code}`, cause: chunk }))
     }
@@ -147,20 +148,24 @@ const decodeTupleData = (tupleData: Buffer): TupleData => {
 
     const columns = numberOfColumns === 0 ? [] : Array.makeBy<Column>(numberOfColumns, () => {
         const dataType = String.fromCharCode(tupleData[offset++])
-        const length = tupleData.readUInt32BE(offset)
-        offset += 4
-        const data = tupleData.subarray(offset, offset + length)
+        let length = 0;
         switch (dataType) {
             case "n":
-                return { dataType: "null" }
+                return Column.Null()
             case "u":
-                return { dataType: "toast" }
+                return Column.Toast()
             case "t":
+                length = tupleData.readUInt32BE(offset)
+                offset += 4
+                const value = tupleData.subarray(offset, offset + length)
                 offset += length
-                return { dataType: "text", value: data.toString("utf-8") }
+                return Column.Text({ value: value.toString("utf-8") })
             case "b":
+                length = tupleData.readUInt32BE(offset)
+                offset += 4
+                const binaryValue = tupleData.subarray(offset, offset + length)
                 offset += length
-                return { dataType: "binary", value: data }
+                return Column.Binary({ value: binaryValue })
             default:
                 throw new PgReplError({ message: `unknown data type: ${dataType}` })
         }
@@ -203,56 +208,54 @@ const decodeRelatioData = (relationData: Buffer): RelationData => {
         const dataTypeModifier = relationData.readUInt32BE(offset)
         offset += 4
 
-        return { flag: Number(flag), name, dataTypeOID, dataTypeModifier }
+        return { flag, name, dataTypeOID, dataTypeModifier }
     })
 
-    return { relationId, namespace, name, replicaIdentity: Number(replicaIdentity), numberOfColumns, relationColumns: columns }
+    return { relationId, namespace, name, replicaIdentity, numberOfColumns, relationColumns: columns }
 
 }
 
 
-const decodePgOutput = (copyData: CopyData): Effect.Effect<PgOutput, PgReplError, never> => {
-    switch (copyData._tag) {
-        case "keepalive":
-            return Effect.succeed({
-                _tag: "keepalive",
-                serverWalEnd: copyData.serverWalEnd,
-                serverTime: copyData.serverTime,
-                replyRequested: copyData.replyRequested
-            })
-        case "xLogData":
-            const walData = copyData.walData
-            const firstByte = String.fromCharCode(walData[0])
-            switch (firstByte) {
-                case "R":
-                    return Effect.succeed({
-                        _tag: "RELATION",
-                        ...decodeRelatioData(walData.subarray(1))
-                    })
-                case "B":
-                    return Effect.succeed({
-                        _tag: "BEGIN",
-                        finalLSN: walData.readBigUInt64BE(1),
-                        commitTimestamp: walData.readBigUInt64BE(9),
-                        xid: walData.readUInt32BE(17),
-                    })
-                case "I":
-                    if (String.fromCharCode(walData[5]) !== "N") {
-                        return Effect.fail(new PgReplError({ message: "INSERT: expected 'N' tuple" }))
-                    }
-                    return Effect.succeed({
-                        _tag: "INSERT",
-                        relationId: walData.readUInt32BE(1),
-                        tupleData: decodeTupleData(walData.subarray(6))
+const decodeWalData = (walData: Buffer): Effect.Effect<PgOutput, PgReplError> => {
+    const firstByte = String.fromCharCode(walData[0])
+    switch (firstByte) {
+        case "R":
+            return Effect.succeed(PgOutput.Relation(decodeRelatioData(walData.subarray(1))))
 
-                    })
-                default:
-                    return Effect.logInfo("Not implemented this byte: " + firstByte).pipe(
-                        Effect.as({ _tag: "UNKNOWN", type: firstByte, walData: walData })
-                    )
+        case "B":
+            return Effect.succeed(PgOutput.Begin({
+                finalLSN: walData.readBigUInt64BE(1),
+                commitTimestamp: walData.readBigUInt64BE(9),
+                xid: walData.readUInt32BE(17),
+            }))
+
+        case "I":
+            if (String.fromCharCode(walData[5]) !== "N") {
+                return Effect.fail(new PgReplError({ message: "INSERT: expected 'N' tuple" }))
             }
+            return Effect.succeed(PgOutput.Insert({
+                relationId: walData.readUInt32BE(1),
+                tupleData: decodeTupleData(walData.subarray(6)),
+            }))
+
+        default:
+            return Effect.logInfo(`Not implemented this byte: ${firstByte}`).pipe(
+                Effect.as(PgOutput.Unknown({ type: firstByte, walData }))
+            )
     }
 }
+
+const decodePgOutput = Match.type<CopyData>().pipe(
+    Match.tag("Keepalive", (k) =>
+        Effect.succeed(PgOutput.keepalive({
+            serverWalEnd: k.serverWalEnd,
+            serverTime: k.serverTime,
+            replyRequested: k.replyRequested,
+        }))),
+    Match.tag("XLogData", (x) => decodeWalData(x.walData)),
+    Match.exhaustive,
+)
+
 
 
 

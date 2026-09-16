@@ -2,6 +2,7 @@ import { Effect, Stream } from "effect"
 import pg from "pg"
 import * as PgRepl from "./PgRepl"
 import { NodeRuntime } from "@effect/platform-node"
+import { Column, PgOutput } from "./PgRepl"
 
 const connectionString = "postgres://postgres:postgres@localhost:5434/syncengine"
 const slotName = "my_slot"
@@ -10,8 +11,7 @@ const outputPlugin = "pgoutput"
 
 
 const RunReplication = Effect.fn(function* () {
-    // replication: "database" is what turns this into a walsender connection.
-    // @types/pg doesn't declare the field, but the pg runtime reads it.
+
     const connection = yield* Effect.acquireRelease(
         Effect.promise(async () => {
             const connection = new pg.Client({
@@ -35,33 +35,23 @@ const RunReplication = Effect.fn(function* () {
         publication: publicationName,
         protoVersion: 2,
     }).pipe(
-        // Raw CopyData payloads for now: first byte is 'w' (XLogData) or 'k' (keepalive).
-        Stream.runForEach((chunk) => {
-            if (chunk._tag === "keepalive") {
-                return Effect.logInfo(`keepalive ${chunk.serverWalEnd} ${chunk.serverTime} ${chunk.replyRequested}`)
-            }
-            if (chunk._tag === "BEGIN") {
-                return Effect.logInfo(`BEGIN ${chunk.finalLSN} ${chunk.commitTimestamp} ${chunk.xid}`)
-            }
-            if (chunk._tag === "RELATION") {
-                return Effect.logInfo(`RELATION ${chunk.relationId} ${chunk.namespace} ${chunk.name} ${chunk.replicaIdentity} ${chunk.numberOfColumns}`)
-            }
-            if (chunk._tag === "INSERT") {
-                return Effect.forEach(chunk.tupleData.columns, (column) => {
-                    switch (column.dataType) {
-                        case "text":
-                            return Effect.logInfo(`INSERT text ${chunk.relationId} ${column.value}`)
-                        case "binary":
-                            return Effect.logInfo(`INSERT binary ${chunk.relationId} ${Buffer.from(column.value).toString("utf-8")}`)
-                        case "null":
-                            return Effect.logInfo(`INSERT null ${chunk.relationId}`)
-                        case "toast":
-                            return Effect.logInfo(`INSERT toast ${chunk.relationId}`)
-                    }
-                }, { discard: true })
-            }
-            return Effect.void
-        })
+        Stream.runForEach(PgOutput.$match({
+            keepalive: (k) =>
+                Effect.logInfo(`keepalive ${k.serverWalEnd} ${k.serverTime} ${k.replyRequested}`),
+            Begin: (b) =>
+                Effect.logInfo(`BEGIN ${b.finalLSN} ${b.commitTimestamp} ${b.xid}`),
+            Relation: (r) =>
+                Effect.logInfo(`RELATION ${r.relationId} ${r.namespace} ${r.name} ${r.replicaIdentity} ${r.numberOfColumns}` + r.relationColumns.map(c => ` ${c.name} ${c.dataTypeOID} ${c.dataTypeModifier}`).join("")),
+            Insert: (i) =>
+                Effect.forEach(i.tupleData.columns, Column.$match({
+                    Null: () => Effect.logInfo(`INSERT null ${i.relationId}`),
+                    Toast: () => Effect.logInfo(`INSERT toast ${i.relationId}`),
+                    Text: (c) => Effect.logInfo(`INSERT text ${i.relationId} ${c.value}`),
+                    Binary: (c) => Effect.logInfo(`INSERT binary ${i.relationId} ${Buffer.from(c.value).toString("utf-8")}`),
+                }), { discard: true }),
+            Unknown: (u) =>
+                Effect.logDebug(`unhandled message type ${u.type}`),
+        }))
     )
 })
 
