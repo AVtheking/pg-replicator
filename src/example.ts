@@ -40,15 +40,32 @@ const RunReplication = Effect.fn(function* () {
                 Effect.logInfo(`keepalive ${k.serverWalEnd} ${k.serverTime} ${k.replyRequested}`),
             Begin: (b) =>
                 Effect.logInfo(`BEGIN ${b.finalLSN} ${b.commitTimestamp} ${b.xid}`),
-            Relation: (r) =>
-                Effect.logInfo(`RELATION ${r.relationId} ${r.namespace} ${r.name} ${r.replicaIdentity} ${r.numberOfColumns}` + r.relationColumns.map(c => ` ${c.name} ${c.dataTypeOID} ${c.dataTypeModifier}`).join("")),
-            Insert: (i) =>
-                Effect.forEach(i.tupleData.columns, Column.$match({
-                    Null: () => Effect.logInfo(`INSERT null ${i.relationId}`),
-                    Toast: () => Effect.logInfo(`INSERT toast ${i.relationId}`),
-                    Text: (c) => Effect.logInfo(`INSERT text ${i.relationId} ${c.value}`),
-                    Binary: (c) => Effect.logInfo(`INSERT binary ${i.relationId} ${Buffer.from(c.value).toString("utf-8")}`),
-                }), { discard: true }),
+            Relation: (r) => {
+                const header = `| Name           | Data Type OID |\n| -------------- | ------------- |`
+                const rows = r.relationColumns.map(c =>
+                    `| ${c.name.padEnd(14)} | ${c.dataTypeOID.toString().padEnd(13)} |`
+                )
+                const table = [header, ...rows].join("\n")
+                return Effect.logInfo(
+                    [
+                        `RELATION`,
+                        `Relation ID: ${r.relationId}`,
+                        `Namespace: ${r.namespace}`,
+                        `Name: ${r.name}`,
+                        `Replica Identity: ${r.replicaIdentity}`,
+                        `Number of Columns: ${r.numberOfColumns}`,
+                        table
+                    ].join("\n")
+                )
+            },
+
+            Insert: (i) => Effect.logInfo(`INSERT  ${JSON.stringify(i.rows)}`),
+            // Effect.forEach(i.tupleData.columns, Column.$match({
+            //     Null: () => Effect.logInfo(`INSERT null ${i.relationId}`),
+            //     Toast: () => Effect.logInfo(`INSERT toast ${i.relationId}`),
+            //     Text: (c) => Effect.logInfo(`INSERT text ${i.relationId} ${c.value}`),
+            //     Binary: (c) => Effect.logInfo(`INSERT binary ${i.relationId} ${Buffer.from(c.value).toString("utf-8")}`),
+            // }), { discard: true }),
             Unknown: (u) =>
                 Effect.logDebug(`unhandled message type ${u.type}`),
         }))

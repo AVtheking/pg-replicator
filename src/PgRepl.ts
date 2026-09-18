@@ -109,6 +109,7 @@ export type PgOutput = Data.TaggedEnum<{
     Insert: {
         relationId: number
         tupleData: TupleData
+        rows?: Record<string, unknown>
     }
     Unknown: {
         type: string
@@ -345,6 +346,40 @@ export const fromPg = (client: pg.Client): PgRepl => {
                     msg._tag === "Unknown"
                         ? Effect.logInfo(`Not implemented this byte: ${msg.type}`)
                         : Effect.void
+                ),
+                Stream.mapAccum(
+                    (): Map<number, RelationData> => new Map(),
+                    (relations, msg): readonly [Map<number, RelationData>, ReadonlyArray<PgOutput>] => {
+                        switch (msg._tag) {
+                            case "Relation": {
+                                relations.set(msg.relationId, msg)
+                                return [relations, [msg]]
+                            }
+                            case "Insert": {
+                                const relation = relations.get(msg.relationId)
+
+                                if (!relation) {
+                                    return [relations, []]
+                                }
+
+                                const rows: Record<string, unknown> = {}
+                                relation.relationColumns.forEach((column, i) => {
+                                    const tuple = msg.tupleData.columns[i]
+                                    Column.$match(tuple, {
+                                        Null: () => rows[column.name] = null,
+                                        Toast: () => rows[column.name] = "(unchanged)",
+                                        Text: (t) => rows[column.name] = t.value,
+                                        Binary: (b) => rows[column.name] = b.value,
+                                    })
+                                })
+
+                                return [relations, [PgOutput.Insert({ ...msg, rows })]]
+                            }
+                            default:
+                                return [relations, [msg]]
+                        }
+                    }
+
                 )
             )
     }
