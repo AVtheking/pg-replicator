@@ -117,6 +117,22 @@ export type PgOutput = Data.TaggedEnum<{
         tupleData: TupleData
         rows?: Record<string, unknown>
     }
+    Update: {
+        xid?: number
+        relationId: number
+        oldTupleKind?: "K" | "O"
+        oldTupleData?: TupleData
+        newTupleData: TupleData
+        oldRows?: Record<string, unknown>
+        newRows?: Record<string, unknown>
+    }
+    Delete: {
+        xid?: number
+        relationId: number
+        oldTupleKind?: "K" | "O"
+        oldTupleData?: TupleData
+        rows?: Record<string, unknown>
+    }
     Unknown: {
         type: string
         walData: Buffer
@@ -151,7 +167,7 @@ const decodeCopyData = (chunk: Buffer): Result.Result<CopyData, PgReplError> => 
     }
 }
 
-const decodeTupleData = (tupleData: Buffer): Result.Result<TupleData, PgReplError> => {
+const decodeTupleData = (tupleData: Buffer): Result.Result<{ tupleData: TupleData, finalOffset: number }, PgReplError> => {
     let offset = 0
     const numberOfColumns = tupleData.readUInt16BE(offset)
     offset += 2
@@ -183,8 +199,8 @@ const decodeTupleData = (tupleData: Buffer): Result.Result<TupleData, PgReplErro
     }
 
     return Result.succeed({
-        numberOfColumns,
-        columns
+        tupleData: { numberOfColumns, columns },
+        finalOffset: offset
     })
 }
 
@@ -254,12 +270,58 @@ const decodeWalData = (walData: Buffer): Result.Result<PgOutput, PgReplError> =>
             return Result.map(decodeTupleData(walData.subarray(6)), (tupleData) =>
                 PgOutput.Insert({
                     relationId: walData.readUInt32BE(1),
-                    tupleData: tupleData,
+                    tupleData: tupleData.tupleData,
                 }))
+        case "U": {
+            const relationId = walData.readUInt32BE(1)
+            let offset = 5
+            let marker = String.fromCharCode(walData[offset++])
+            let oldTupleData: TupleData | undefined
+            let oldTupleKind: "K" | "O" | undefined
 
+            if (marker === "K" || marker === "O") {
+                const result = decodeTupleData(walData.subarray(offset))
+
+                if (Result.isFailure(result)) {
+                    return Result.fail(new PgReplError({ message: `UPDATE: failed to decode old tuple`, cause: result }))
+                }
+
+                oldTupleData = result.success.tupleData
+                oldTupleKind = marker
+                offset += result.success.finalOffset
+                marker = String.fromCharCode(walData[offset++])
+            }
+
+            if (marker !== "N") {
+                return Result.fail(new PgReplError({ message: `UPDATE: expected 'N' tuple, got ${marker}` }))
+            }
+
+            return Result.map(decodeTupleData(walData.subarray(offset)), (result) => PgOutput.Update({
+                relationId,
+                oldTupleKind,
+                oldTupleData,
+                newTupleData: result.tupleData,
+            }))
+        }
+        case "D": {
+            const relationId = walData.readUInt32BE(1)
+            const marker = String.fromCharCode(walData[5])
+
+            if (marker === "K" || marker === "O") {
+                const result = decodeTupleData(walData.subarray(6))
+
+                if (Result.isFailure(result)) {
+                    return Result.fail(new PgReplError({ message: `DELETE: failed to decode old tuple`, cause: result }))
+                }
+                return Result.succeed(PgOutput.Delete({
+                    relationId,
+                    oldTupleKind: marker,
+                    oldTupleData: result.success.tupleData,
+                }))
+            }
+        }
         default:
             return Result.succeed(PgOutput.Unknown({ type: firstByte, walData }))
-
     }
 }
 
@@ -350,7 +412,7 @@ export const fromPg = (client: pg.Client): PgRepl => {
 
                     const mode = option.mode ? option.mode : "LOGICAL"
 
-                    const sql = `START_REPLICATION SLOT ${option.slot} ${mode} ${option.startLSN} (proto_version '${option.protoVersion}', publication_names '${option.publication}')`
+                    const sql = `START_REPLICATION SLOT ${option.slot} ${mode} ${option.startLSN}(proto_version '${option.protoVersion}', publication_names '${option.publication}')`
 
                     //not awaited
                     client.query(sql).catch((error) => Queue.failCauseUnsafe(queue, Cause.fail(new PgReplError({ message: `command failed : ${sql}`, cause: error }))))
@@ -378,18 +440,35 @@ export const fromPg = (client: pg.Client): PgRepl => {
                                     return [relations, []]
                                 }
 
-                                const rows: Record<string, unknown> = {}
-                                relation.relationColumns.forEach((column, i) => {
-                                    const tuple = msg.tupleData.columns[i]
-                                    Column.$match(tuple, {
-                                        Null: () => rows[column.name] = null,
-                                        Toast: () => rows[column.name] = "(unchanged)",
-                                        Text: (t) => rows[column.name] = t.value,
-                                        Binary: (b) => rows[column.name] = b.value,
-                                    })
-                                })
-
+                                const rows = convertToRows(relation, msg.tupleData)
                                 return [relations, [PgOutput.Insert({ ...msg, rows })]]
+                            }
+                            case "Update": {
+                                const relation = relations.get(msg.relationId)
+                                if (!relation) {
+                                    return [relations, []]
+                                }
+
+                                let oldRows: Record<string, unknown> | undefined
+                                if (msg.oldTupleData) {
+                                    oldRows = convertToRows(relation, msg.oldTupleData)
+                                }
+
+                                const newRows = convertToRows(relation, msg.newTupleData)
+                                return [relations, [PgOutput.Update({ ...msg, oldRows, newRows })]]
+                            }
+                            case "Delete": {
+                                const relation = relations.get(msg.relationId)
+                                if (!relation) {
+                                    return [relations, []]
+                                }
+
+                                let oldRows: Record<string, unknown> | undefined
+                                if (msg.oldTupleData) {
+                                    oldRows = convertToRows(relation, msg.oldTupleData)
+                                }
+
+                                return [relations, [PgOutput.Delete({ ...msg, rows: oldRows })]]
                             }
                             default:
                                 return [relations, [msg]]
@@ -399,5 +478,21 @@ export const fromPg = (client: pg.Client): PgRepl => {
                 )
             )
     }
+}
+
+
+const convertToRows = (relation: RelationData, tupleData: TupleData) => {
+    const rows: Record<string, unknown> = {}
+    relation.relationColumns.forEach((column, i) => {
+        const tuple = tupleData.columns[i]
+        Column.$match(tuple, {
+            Null: () => rows[column.name] = null,
+            Toast: () => rows[column.name] = "(unchanged)",
+            Text: (t) => rows[column.name] = t.value,
+            Binary: (b) => rows[column.name] = b.value,
+        })
+    })
+
+    return rows
 }
 

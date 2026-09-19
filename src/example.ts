@@ -37,7 +37,7 @@ const RunReplication = Effect.fn(function* () {
     }).pipe(
         Stream.runForEach(PgOutput.$match({
             Keepalive: (k) =>
-                Effect.logInfo(`keepalive ${k.serverWalEnd} ${k.serverTime} ${k.replyRequested}`),
+                Effect.logInfo(`keepalive`),
             Begin: (b) =>
                 Effect.logInfo(`BEGIN ${b.finalLSN} ${b.commitTimestamp} ${b.xid}`),
             Relation: (r) => {
@@ -66,6 +66,8 @@ const RunReplication = Effect.fn(function* () {
             //     Text: (c) => Effect.logInfo(`INSERT text ${i.relationId} ${c.value}`),
             //     Binary: (c) => Effect.logInfo(`INSERT binary ${i.relationId} ${Buffer.from(c.value).toString("utf-8")}`),
             // }), { discard: true }),
+            Update: (u) => Effect.logInfo(`UPDATE  ${JSON.stringify(u.oldRows)} ${JSON.stringify(u.newRows)}`),
+            Delete: (d) => Effect.logInfo(`DELETE  ${JSON.stringify(d.rows)}`),
             Commit: (c) =>
                 Effect.logInfo(`COMMIT ${c.flags} ${c.commitLSN} ${c.endLSN} ${c.commitTimestamp}`),
             Unknown: (u) =>
