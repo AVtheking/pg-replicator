@@ -1,5 +1,5 @@
-import { Cause, Data, Effect, Queue, Stream, Array, Match, Result } from "effect"
-import pg from "pg"
+import { Cause, Data, Effect, Queue, Stream, Array, Match, Result, Ref } from "effect"
+import pg, { Connection } from "pg"
 
 export class PgReplError extends Data.TaggedError("PgReplError")<{
     readonly message: string
@@ -104,14 +104,7 @@ export type PgOutput = Data.TaggedEnum<{
         endLSN: bigint
         commitTimestamp: Date
     }
-    Relation: {
-        relationId: number
-        namespace: string
-        name: string
-        replicaIdentity: number
-        numberOfColumns: number
-        relationColumns: RelationColumn[]
-    }
+    Relation: RelationData
     Insert: {
         relationId: number
         tupleData: TupleData
@@ -145,6 +138,20 @@ export const PgOutput = Data.taggedEnum<PgOutput>()
 const PG_EPOCH_OFFSET_US = 946_684_800_000_000n
 
 const pgTimeToDate = (time: bigint): Date => new Date(Number((time + PG_EPOCH_OFFSET_US) / 1000n))
+const dateToPgTime = (date: Date): bigint => (BigInt(date.getTime()) - PG_EPOCH_OFFSET_US) * 1000n
+
+const encodeStandByStatusUpdate = (lsn: bigint, replyRequested = false): Buffer => {
+    const buf = Buffer.alloc(34)
+
+    buf.writeUint8(0x72, 0)
+    buf.writeBigUInt64BE(lsn, 1)
+    buf.writeBigInt64BE(lsn, 9)
+    buf.writeBigInt64BE(lsn, 17)
+    buf.writeBigUInt64BE(dateToPgTime(new Date()), 25)
+    buf.writeUint8(replyRequested ? 1 : 0, 33)
+
+    return buf
+}
 
 const decodeCopyData = (chunk: Buffer): Result.Result<CopyData, PgReplError> => {
     const code = String.fromCharCode(chunk[0])
@@ -339,13 +346,27 @@ const decodePgOutput = Match.type<CopyData>().pipe(
 
 
 
+interface ReplicationConnection extends Connection {
+    sendCopyfromChunk(chunk: Buffer): void
+}
+
 
 export interface PgRepl {
     createReplicationSlot(option: CreateReplicationSlot): Effect.Effect<CreateReplicationSlotResult, PgReplError, never>
     startReplication(option: StartReplicationOption): Stream.Stream<PgOutput, PgReplError>
+    ack(lsn: bigint): Effect.Effect<void, PgReplError, never>
 }
 
-export const fromPg = (client: pg.Client): PgRepl => {
+export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(function* () {
+
+    const lastAckedLSN = yield* Ref.make<bigint | null>(null)
+
+    const sendStatus = (replyRequested = false) =>
+        Effect.gen(function* () {
+            const lsn = yield* Ref.get(lastAckedLSN)
+            if (!lsn) return
+            (client.connection as ReplicationConnection).sendCopyfromChunk(encodeStandByStatusUpdate(lsn, replyRequested))
+        })
 
     const runCommand = (sql: string) =>
         Effect.tryPromise({
@@ -354,6 +375,9 @@ export const fromPg = (client: pg.Client): PgRepl => {
         })
 
     return {
+        ack: (lsn: bigint) =>
+            Effect.sync(() => Ref.set(lastAckedLSN, lsn)).pipe(Effect.andThen(() => sendStatus())),
+
         createReplicationSlot: Effect.fn(function* (option: CreateReplicationSlot) {
             const temporaryStr = option.options?.temporary ? "TEMPORARY" : ""
             const mode = option.options?.mode ?? ReplicationMode.Logical
@@ -410,6 +434,7 @@ export const fromPg = (client: pg.Client): PgRepl => {
                         })
                     )
 
+                    yield* Ref.set(lastAckedLSN, option.startLSN)
                     const mode = option.mode ? option.mode : "LOGICAL"
 
                     const sql = `START_REPLICATION SLOT ${option.slot} ${mode} ${option.startLSN}(proto_version '${option.protoVersion}', publication_names '${option.publication}')`
@@ -421,9 +446,19 @@ export const fromPg = (client: pg.Client): PgRepl => {
                 Stream.mapEffect((chunk) =>
                     Effect.fromResult(Result.flatMap(decodeCopyData(chunk), decodePgOutput))),
                 Stream.tap((msg) =>
-                    msg._tag === "Unknown"
-                        ? Effect.logInfo(`Not implemented this byte: ${msg.type}`)
-                        : Effect.void
+                    Match.value(msg).pipe(
+                        Match.withReturnType<Effect.Effect<void, never, never>>(),
+                        Match.tag("Keepalive", (k) => {
+                            if (k.replyRequested) {
+                                return sendStatus(true)
+                            }
+                            return Effect.void
+                        }),
+                        Match.tag("Unknown", (u) => {
+                            return Effect.logInfo(`Not implemented this byte: ${u.type}`)
+                        }),
+                        Match.orElse(() => Effect.void)
+                    )
                 ),
                 Stream.mapAccum(
                     (): Map<number, RelationData> => new Map(),
@@ -478,7 +513,7 @@ export const fromPg = (client: pg.Client): PgRepl => {
                 )
             )
     }
-}
+})
 
 
 const convertToRows = (relation: RelationData, tupleData: TupleData) => {
