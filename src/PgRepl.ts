@@ -72,7 +72,7 @@ type TupleData = {
 }
 
 type RelationColumn = {
-    flag: string
+    flag: number
     name: string
     dataTypeOID: number
     dataTypeModifier: number
@@ -82,7 +82,7 @@ type RelationData = {
     relationId: number
     namespace: string
     name: string
-    replicaIdentity: string
+    replicaIdentity: number
     numberOfColumns: number
     relationColumns: RelationColumn[]
 }
@@ -98,11 +98,17 @@ export type PgOutput = Data.TaggedEnum<{
         commitTimestamp: bigint
         xid: number
     }
+    Commit: {
+        flags: number
+        commitLSN: bigint
+        endLSN: bigint
+        commitTimestamp: Date
+    }
     Relation: {
         relationId: number
         namespace: string
         name: string
-        replicaIdentity: string
+        replicaIdentity: number
         numberOfColumns: number
         relationColumns: RelationColumn[]
     }
@@ -119,7 +125,10 @@ export type PgOutput = Data.TaggedEnum<{
 
 export const PgOutput = Data.taggedEnum<PgOutput>()
 
+// Postgres epoch (2000-01-01T00:00:00Z) minus Unix epoch, in microseconds
+const PG_EPOCH_OFFSET_US = 946_684_800_000_000n
 
+const pgTimeToDate = (time: bigint): Date => new Date(Number((time + PG_EPOCH_OFFSET_US) / 1000n))
 
 const decodeCopyData = (chunk: Buffer): Result.Result<CopyData, PgReplError> => {
     const code = String.fromCharCode(chunk[0])
@@ -195,12 +204,12 @@ const decodeRelatioData = (relationData: Buffer): RelationData => {
     const [name, nameLen] = readCString(relationData, offset)
     offset = nameLen
 
-    const replicaIdentity = String.fromCharCode(relationData[offset++])
+    const replicaIdentity = relationData.readUInt8(offset++)
     const numberOfColumns = relationData.readUInt16BE(offset)
     offset += 2
 
     const columns = numberOfColumns === 0 ? [] : Array.makeBy<RelationColumn>(numberOfColumns, () => {
-        const flag = String.fromCharCode(relationData[offset++])
+        const flag = relationData.readUInt8(offset++)
         const [name, columnNameLen] = readCString(relationData, offset)
         offset = columnNameLen
 
@@ -229,6 +238,13 @@ const decodeWalData = (walData: Buffer): Result.Result<PgOutput, PgReplError> =>
                 finalLSN: walData.readBigUInt64BE(1),
                 commitTimestamp: walData.readBigUInt64BE(9),
                 xid: walData.readUInt32BE(17),
+            }))
+        case "C":
+            return Result.succeed(PgOutput.Commit({
+                flags: walData.readUInt8(1),
+                commitLSN: walData.readBigUInt64BE(2),
+                endLSN: walData.readBigUInt64BE(10),
+                commitTimestamp: pgTimeToDate(walData.readBigUInt64BE(18)),
             }))
 
         case "I":

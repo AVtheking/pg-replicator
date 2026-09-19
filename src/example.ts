@@ -66,6 +66,8 @@ const RunReplication = Effect.fn(function* () {
             //     Text: (c) => Effect.logInfo(`INSERT text ${i.relationId} ${c.value}`),
             //     Binary: (c) => Effect.logInfo(`INSERT binary ${i.relationId} ${Buffer.from(c.value).toString("utf-8")}`),
             // }), { discard: true }),
+            Commit: (c) =>
+                Effect.logInfo(`COMMIT ${c.flags} ${c.commitLSN} ${c.endLSN} ${c.commitTimestamp}`),
             Unknown: (u) =>
                 Effect.logDebug(`unhandled message type ${u.type}`),
         }))
