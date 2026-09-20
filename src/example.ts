@@ -11,7 +11,6 @@ const outputPlugin = "pgoutput"
 
 
 const RunReplication = Effect.fn(function* () {
-
     const connection = yield* Effect.acquireRelease(
         Effect.promise(async () => {
             const connection = new pg.Client({
@@ -24,7 +23,7 @@ const RunReplication = Effect.fn(function* () {
         (connection) => Effect.promise(() => connection.end())
     )
 
-    const repl = PgRepl.fromPg(connection)
+    const repl = yield* PgRepl.fromPg(connection)
 
     const slot = yield* repl.createReplicationSlot({ slotName, outputPlugin, options: { temporary: true } })
     yield* Effect.logInfo(`slot ${slot.name} created at ${slot.consistentPoint}`)
@@ -37,7 +36,7 @@ const RunReplication = Effect.fn(function* () {
     }).pipe(
         Stream.runForEach(PgOutput.$match({
             Keepalive: (k) =>
-                Effect.logInfo(`keepalive`),
+                Effect.logInfo(`keepalive ${PgRepl.formatLSN(k.serverWalEnd)} dated ${k.serverTime.toISOString()} replyRequested: ${k.replyRequested}`),
             Begin: (b) =>
                 Effect.logInfo(`BEGIN ${b.finalLSN} ${b.commitTimestamp} ${b.xid}`),
             Relation: (r) => {
@@ -68,8 +67,9 @@ const RunReplication = Effect.fn(function* () {
             // }), { discard: true }),
             Update: (u) => Effect.logInfo(`UPDATE  ${JSON.stringify(u.oldRows)} ${JSON.stringify(u.newRows)}`),
             Delete: (d) => Effect.logInfo(`DELETE  ${JSON.stringify(d.rows)}`),
-            Commit: (c) =>
-                Effect.logInfo(`COMMIT ${c.flags} ${c.commitLSN} ${c.endLSN} ${c.commitTimestamp}`),
+            Commit: (c) => repl.ack(c.endLSN).pipe(
+                Effect.andThen(Effect.logInfo(`Acknowledged commit with LSN ${PgRepl.formatLSN(c.endLSN)} dated ${c.commitTimestamp}`)))
+            ,
             Unknown: (u) =>
                 Effect.logDebug(`unhandled message type ${u.type}`),
         }))

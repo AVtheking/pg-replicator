@@ -1,4 +1,4 @@
-import { Cause, Data, Effect, Queue, Stream, Array, Match, Result, Ref } from "effect"
+import { Cause, Data, Effect, Queue, Stream, Array, Match, Result, Ref, Schedule } from "effect"
 import pg, { Connection } from "pg"
 
 export class PgReplError extends Data.TaggedError("PgReplError")<{
@@ -23,14 +23,14 @@ export interface CreateReplicationSlot {
 
 export interface CreateReplicationSlotResult {
     name: string
-    consistentPoint: string
+    consistentPoint: bigint
     snapshotName: string | null
     outputPlugin: string
 }
 
 export interface StartReplicationOption {
     slot: string
-    startLSN: string
+    startLSN: bigint
     publication: string
     protoVersion: number
     mode?: ReplicationMode
@@ -41,12 +41,14 @@ export enum CopyDataCode {
     XLogData = "w",
 }
 
+export interface Keepalive {
+    serverWalEnd: bigint
+    serverTime: Date
+    replyRequested: boolean
+}
+
 export type CopyData = Data.TaggedEnum<{
-    Keepalive: {
-        serverWalEnd: bigint
-        serverTime: bigint
-        replyRequested: boolean
-    }
+    Keepalive: Keepalive
     XLogData: {
         serverWalStart: bigint
         serverWalEnd: bigint
@@ -88,11 +90,7 @@ type RelationData = {
 }
 
 export type PgOutput = Data.TaggedEnum<{
-    Keepalive: {
-        serverWalEnd: bigint
-        serverTime: bigint
-        replyRequested: boolean
-    }
+    Keepalive: Keepalive
     Begin: {
         finalLSN: bigint
         commitTimestamp: bigint
@@ -138,7 +136,15 @@ export const PgOutput = Data.taggedEnum<PgOutput>()
 const PG_EPOCH_OFFSET_US = 946_684_800_000_000n
 
 const pgTimeToDate = (time: bigint): Date => new Date(Number((time + PG_EPOCH_OFFSET_US) / 1000n))
-const dateToPgTime = (date: Date): bigint => (BigInt(date.getTime()) - PG_EPOCH_OFFSET_US) * 1000n
+const dateToPgTime = (date: Date): bigint => (BigInt(date.getTime()) * 1000n - PG_EPOCH_OFFSET_US)
+
+export const parseLSN = (lsn: string): bigint => {
+    const [hi, lo] = lsn.split("/")
+    return (BigInt(`0x${hi}`) << 32n) | BigInt(`0x${lo}`)
+}
+
+export const formatLSN = (lsn: bigint): string =>
+    `${(lsn >> 32n).toString(16).toUpperCase()}/${(lsn & 0xFFFFFFFFn).toString(16).toUpperCase()}`
 
 const encodeStandByStatusUpdate = (lsn: bigint, replyRequested = false): Buffer => {
     const buf = Buffer.alloc(34)
@@ -159,7 +165,7 @@ const decodeCopyData = (chunk: Buffer): Result.Result<CopyData, PgReplError> => 
         case CopyDataCode.Keepalive:
             return Result.succeed(CopyData.Keepalive({
                 serverWalEnd: chunk.readBigUInt64BE(1),
-                serverTime: chunk.readBigUInt64BE(9),
+                serverTime: pgTimeToDate(chunk.readBigUInt64BE(9)),
                 replyRequested: chunk[17] !== 0
             }))
         case CopyDataCode.XLogData:
@@ -347,7 +353,7 @@ const decodePgOutput = Match.type<CopyData>().pipe(
 
 
 interface ReplicationConnection extends Connection {
-    sendCopyfromChunk(chunk: Buffer): void
+    sendCopyFromChunk(chunk: Buffer): void
 }
 
 
@@ -364,8 +370,8 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
     const sendStatus = (replyRequested = false) =>
         Effect.gen(function* () {
             const lsn = yield* Ref.get(lastAckedLSN)
-            if (!lsn) return
-            (client.connection as ReplicationConnection).sendCopyfromChunk(encodeStandByStatusUpdate(lsn, replyRequested))
+            if (lsn === null) return
+            (client.connection as ReplicationConnection).sendCopyFromChunk(encodeStandByStatusUpdate(lsn, replyRequested))
         })
 
     const runCommand = (sql: string) =>
@@ -375,8 +381,7 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
         })
 
     return {
-        ack: (lsn: bigint) =>
-            Effect.sync(() => Ref.set(lastAckedLSN, lsn)).pipe(Effect.andThen(() => sendStatus())),
+        ack: (lsn: bigint) => Ref.set(lastAckedLSN, lsn).pipe(Effect.andThen(() => sendStatus())),
 
         createReplicationSlot: Effect.fn(function* (option: CreateReplicationSlot) {
             const temporaryStr = option.options?.temporary ? "TEMPORARY" : ""
@@ -392,7 +397,7 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
             const row = result.rows[0]
             return {
                 name: row.slot_name,
-                consistentPoint: row.consistent_point,
+                consistentPoint: parseLSN(row.consistent_point),
                 snapshotName: row.snapshot_name ?? null,
                 outputPlugin: row.output_plugin
             }
@@ -434,13 +439,18 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
                         })
                     )
 
-                    yield* Ref.set(lastAckedLSN, option.startLSN)
                     const mode = option.mode ? option.mode : "LOGICAL"
 
-                    const sql = `START_REPLICATION SLOT ${option.slot} ${mode} ${option.startLSN}(proto_version '${option.protoVersion}', publication_names '${option.publication}')`
+                    const sql = `START_REPLICATION SLOT ${option.slot} ${mode} ${formatLSN(option.startLSN)} (proto_version '${option.protoVersion}', publication_names '${option.publication}')`
 
                     //not awaited
                     client.query(sql).catch((error) => Queue.failCauseUnsafe(queue, Cause.fail(new PgReplError({ message: `command failed : ${sql}`, cause: error }))))
+
+                    yield* Ref.set(lastAckedLSN, option.startLSN)
+                        // yield* sendStatus().pipe(
+                        //     Effect.repeat(Schedule.spaced("10 seconds")),
+                        //     Effect.forkScoped
+                        // )
                 })
             }).pipe(
                 Stream.mapEffect((chunk) =>
@@ -450,7 +460,7 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
                         Match.withReturnType<Effect.Effect<void, never, never>>(),
                         Match.tag("Keepalive", (k) => {
                             if (k.replyRequested) {
-                                return sendStatus(true)
+                                return sendStatus()
                             }
                             return Effect.void
                         }),
