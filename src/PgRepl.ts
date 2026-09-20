@@ -1,10 +1,6 @@
-import { Cause, Data, Effect, Queue, Stream, Array, Match, Result, Ref, Schedule } from "effect"
+import { Cause, Data, Effect, Queue, Stream, Array, Match, Result, Ref } from "effect"
 import pg, { Connection } from "pg"
-
-export class PgReplError extends Data.TaggedError("PgReplError")<{
-    readonly message: string
-    readonly cause?: unknown
-}> { }
+import { PgReplError, SlotAlreadyExists } from "./error"
 
 
 export enum ReplicationMode {
@@ -358,8 +354,9 @@ interface ReplicationConnection extends Connection {
 
 
 export interface PgRepl {
-    createReplicationSlot(option: CreateReplicationSlot): Effect.Effect<CreateReplicationSlotResult, PgReplError, never>
+    createReplicationSlot(option: CreateReplicationSlot): Effect.Effect<CreateReplicationSlotResult, PgReplError | SlotAlreadyExists, never>
     startReplication(option: StartReplicationOption): Stream.Stream<PgOutput, PgReplError>
+    dropReplicationSlot(slotName: string): Effect.Effect<void, PgReplError, never>
     ack(lsn: bigint): Effect.Effect<void, PgReplError, never>
 }
 
@@ -374,12 +371,6 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
             (client.connection as ReplicationConnection).sendCopyFromChunk(encodeStandByStatusUpdate(lsn, replyRequested))
         })
 
-    const runCommand = (sql: string) =>
-        Effect.tryPromise({
-            try: () => client.query(sql),
-            catch: (error) => new PgReplError({ message: `command failed : ${sql}`, cause: error })
-        })
-
     return {
         ack: (lsn: bigint) => Ref.set(lastAckedLSN, lsn).pipe(Effect.andThen(() => sendStatus())),
 
@@ -387,7 +378,15 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
             const temporaryStr = option.options?.temporary ? "TEMPORARY" : ""
             const mode = option.options?.mode ?? ReplicationMode.Logical
 
-            const result = yield* runCommand(`CREATE_REPLICATION_SLOT ${option.slotName} ${temporaryStr} ${mode} ${option.outputPlugin}`)
+            const sql = `CREATE_REPLICATION_SLOT ${option.slotName} ${temporaryStr} ${mode} ${option.outputPlugin}`
+            const result = yield* Effect.tryPromise({
+                try: () => client.query(sql),
+                catch: (error) =>
+                    (error as any).code === "42710"
+                        ? new SlotAlreadyExists({ slotName: option.slotName })
+                        : new PgReplError({ message: `command failed : ${sql}`, cause: error })
+            })
+
 
             if (result.rows.length > 1) {
                 return yield* Effect.fail(
@@ -404,6 +403,14 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
 
         }),
 
+        dropReplicationSlot: (slotName: string) =>
+            Effect.gen(function* () {
+                yield* Effect.tryPromise({
+                    try: () => client.query(`DROP_REPLICATION_SLOT ${slotName}`),
+                    catch: (error) => new PgReplError({ message: `command failed : DROP_REPLICATION_SLOT ${slotName}`, cause: error })
+                })
+            }),
+
         startReplication: (option: StartReplicationOption) =>
             Stream.callback<Buffer, PgReplError>((queue) => {
                 return Effect.gen(function* () {
@@ -411,11 +418,9 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
                     const onCopyData = (msg: { chunk: Buffer }) => {
                         Queue.offerUnsafe(queue, msg.chunk)
                     }
-
                     const onCopyDone = () => {
                         Queue.endUnsafe(queue)
                     }
-
                     const onError = (error: Error) => {
                         Queue.failCauseUnsafe(queue, Cause.fail(new PgReplError({ message: `connection error`, cause: error })))
                     }
@@ -447,10 +452,10 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
                     client.query(sql).catch((error) => Queue.failCauseUnsafe(queue, Cause.fail(new PgReplError({ message: `command failed : ${sql}`, cause: error }))))
 
                     yield* Ref.set(lastAckedLSN, option.startLSN)
-                        // yield* sendStatus().pipe(
-                        //     Effect.repeat(Schedule.spaced("10 seconds")),
-                        //     Effect.forkScoped
-                        // )
+                    // yield* sendStatus().pipe(
+                    //     Effect.repeat(Schedule.spaced("10 seconds")),
+                    //     Effect.forkScoped
+                    // )
                 })
             }).pipe(
                 Stream.mapEffect((chunk) =>
@@ -484,7 +489,6 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
                                 if (!relation) {
                                     return [relations, []]
                                 }
-
                                 const rows = convertToRows(relation, msg.tupleData)
                                 return [relations, [PgOutput.Insert({ ...msg, rows })]]
                             }
@@ -512,7 +516,6 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
                                 if (msg.oldTupleData) {
                                     oldRows = convertToRows(relation, msg.oldTupleData)
                                 }
-
                                 return [relations, [PgOutput.Delete({ ...msg, rows: oldRows })]]
                             }
                             default:
@@ -530,6 +533,7 @@ const convertToRows = (relation: RelationData, tupleData: TupleData) => {
     const rows: Record<string, unknown> = {}
     relation.relationColumns.forEach((column, i) => {
         const tuple = tupleData.columns[i]
+
         Column.$match(tuple, {
             Null: () => rows[column.name] = null,
             Toast: () => rows[column.name] = "(unchanged)",

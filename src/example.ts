@@ -3,6 +3,7 @@ import pg from "pg"
 import * as PgRepl from "./PgRepl"
 import { NodeRuntime } from "@effect/platform-node"
 import { Column, PgOutput } from "./PgRepl"
+import { SlotAlreadyExists } from "./error"
 
 const connectionString = "postgres://postgres:postgres@localhost:5434/syncengine"
 const slotName = "my_slot"
@@ -25,12 +26,18 @@ const RunReplication = Effect.fn(function* () {
 
     const repl = yield* PgRepl.fromPg(connection)
 
-    const slot = yield* repl.createReplicationSlot({ slotName, outputPlugin, options: { temporary: true } })
-    yield* Effect.logInfo(`slot ${slot.name} created at ${slot.consistentPoint}`)
+    const startLSN = yield* repl.createReplicationSlot({ slotName, outputPlugin }).pipe(
+        Effect.map((slot) => slot.consistentPoint),
+        Effect.catchTag("SlotAlreadyExists", () =>
+            Effect.logInfo(`slot ${slotName} already exists, resuming`).pipe(Effect.as(0n))
+        )
+    )
+
+    yield* Effect.logInfo(`slot ${slotName} created at ${PgRepl.formatLSN(startLSN)}`)
 
     yield* repl.startReplication({
-        slot: slot.name,
-        startLSN: slot.consistentPoint,
+        slot: slotName,
+        startLSN: startLSN,
         publication: publicationName,
         protoVersion: 2,
     }).pipe(
