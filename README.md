@@ -107,7 +107,7 @@ const program = Effect.gen(function* () {
 program.pipe(Effect.scoped, NodeRuntime.runMain)
 ```
 
-A runnable version lives in [`examples/basic.ts`](./examples/basic.ts).
+A runnable version lives in [`examples/basic.ts`](./examples/basic.ts). [`examples/init.sql`](./examples/init.sql) creates the `todos` table and `sync_pub` publication it expects.
 
 ## API
 
@@ -175,7 +175,8 @@ Both are `Data.TaggedError`s and work with `Effect.catchTag`.
 pnpm install
 pnpm typecheck        # tsc --noEmit over src/ and examples/
 pnpm build            # tsdown -> dist/
-pnpm example          # bun examples/basic.ts (needs a local Postgres, see the file for the connection string)
+pnpm example          # bun examples/basic.ts (needs a local Postgres with wal_level=logical,
+                      # seeded with examples/init.sql; see the file for the connection string)
 ```
 
 ## License
