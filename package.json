@@ -34,15 +34,15 @@
     "effect"
   ],
   "author": "AVtheking",
-  "license": "ISC",
+  "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AVtheking/PgRepl.git"
+    "url": "git+https://github.com/AVtheking/pg-replicator.git"
   },
   "bugs": {
-    "url": "https://github.com/AVtheking/PgRepl/issues"
+    "url": "https://github.com/AVtheking/pg-replicator/issues"
   },
-  "homepage": "https://github.com/AVtheking/PgRepl#readme",
+  "homepage": "https://github.com/AVtheking/pg-replicator#readme",
   "engines": {
     "node": ">=20"
   },

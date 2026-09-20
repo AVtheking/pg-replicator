@@ -180,4 +180,4 @@ pnpm example          # bun examples/basic.ts (needs a local Postgres, see the f
 
 ## License
 
-[ISC](./LICENSE)
+[MIT](./LICENSE)
