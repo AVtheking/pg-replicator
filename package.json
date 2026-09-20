@@ -1,21 +1,60 @@
 {
   "name": "pg-replicator",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+  "version": "0.1.0",
+  "description": "Effect-native PostgreSQL logical replication client (pgoutput) built on node-postgres",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
-  "keywords": [],
-  "author": "",
+  "files": [
+    "dist"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsdown",
+    "typecheck": "tsc --noEmit",
+    "example": "bun examples/basic.ts",
+    "prepublishOnly": "pnpm typecheck && pnpm build"
+  },
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "logical-replication",
+    "replication",
+    "pgoutput",
+    "wal",
+    "cdc",
+    "effect"
+  ],
+  "author": "AVtheking",
   "license": "ISC",
-  "dependencies": {
-    "@effect/platform-node": "4.0.0-rc.115",
-    "@effect/sql-pg": "4.0.0-rc.115",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AVtheking/PgRepl.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AVtheking/PgRepl/issues"
+  },
+  "homepage": "https://github.com/AVtheking/PgRepl#readme",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
     "effect": "^4.0.0-rc.115",
     "pg": "^8.23.0"
   },
   "devDependencies": {
-    "@types/pg": "^8.23.1"
+    "@effect/platform-node": "4.0.0-rc.115",
+    "@types/node": "^22.20.2",
+    "@types/pg": "^8.23.1",
+    "effect": "4.0.0-rc.115",
+    "pg": "^8.23.0",
+    "tsdown": "^0.23.0",
+    "typescript": "^5.9.3"
   }
 }
