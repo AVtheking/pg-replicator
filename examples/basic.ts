@@ -1,9 +1,7 @@
 import { Effect, Stream } from "effect"
 import pg from "pg"
-import * as PgRepl from "./PgRepl"
+import * as PgReplicator from "../src"
 import { NodeRuntime } from "@effect/platform-node"
-import { Column, PgOutput } from "./PgRepl"
-import { SlotAlreadyExists } from "./error"
 
 const connectionString = "postgres://postgres:postgres@localhost:5434/syncengine"
 const slotName = "my_slot"
@@ -24,7 +22,7 @@ const RunReplication = Effect.fn(function* () {
         (connection) => Effect.promise(() => connection.end())
     )
 
-    const repl = yield* PgRepl.fromPg(connection)
+    const repl = yield* PgReplicator.fromPg(connection)
 
     const startLSN = yield* repl.createReplicationSlot({ slotName, outputPlugin }).pipe(
         Effect.map((slot) => slot.consistentPoint),
@@ -33,7 +31,7 @@ const RunReplication = Effect.fn(function* () {
         )
     )
 
-    yield* Effect.logInfo(`slot ${slotName} created at ${PgRepl.formatLSN(startLSN)}`)
+    yield* Effect.logInfo(`slot ${slotName} created at ${PgReplicator.formatLSN(startLSN)}`)
 
     yield* repl.startReplication({
         slot: slotName,
@@ -41,9 +39,9 @@ const RunReplication = Effect.fn(function* () {
         publication: publicationName,
         protoVersion: 2,
     }).pipe(
-        Stream.runForEach(PgOutput.$match({
+        Stream.runForEach(PgReplicator.PgOutput.$match({
             Keepalive: (k) =>
-                Effect.logInfo(`keepalive ${PgRepl.formatLSN(k.serverWalEnd)} dated ${k.serverTime.toISOString()} replyRequested: ${k.replyRequested}`),
+                Effect.logInfo(`keepalive ${PgReplicator.formatLSN(k.serverWalEnd)} dated ${k.serverTime.toISOString()} replyRequested: ${k.replyRequested}`),
             Begin: (b) =>
                 Effect.logInfo(`BEGIN ${b.finalLSN} ${b.commitTimestamp} ${b.xid}`),
             Relation: (r) => {
@@ -64,18 +62,11 @@ const RunReplication = Effect.fn(function* () {
                     ].join("\n")
                 )
             },
-
             Insert: (i) => Effect.logInfo(`INSERT  ${JSON.stringify(i.rows)}`),
-            // Effect.forEach(i.tupleData.columns, Column.$match({
-            //     Null: () => Effect.logInfo(`INSERT null ${i.relationId}`),
-            //     Toast: () => Effect.logInfo(`INSERT toast ${i.relationId}`),
-            //     Text: (c) => Effect.logInfo(`INSERT text ${i.relationId} ${c.value}`),
-            //     Binary: (c) => Effect.logInfo(`INSERT binary ${i.relationId} ${Buffer.from(c.value).toString("utf-8")}`),
-            // }), { discard: true }),
             Update: (u) => Effect.logInfo(`UPDATE  ${JSON.stringify(u.oldRows)} ${JSON.stringify(u.newRows)}`),
             Delete: (d) => Effect.logInfo(`DELETE  ${JSON.stringify(d.rows)}`),
             Commit: (c) => repl.ack(c.endLSN).pipe(
-                Effect.andThen(Effect.logInfo(`Acknowledged commit with LSN ${PgRepl.formatLSN(c.endLSN)} dated ${c.commitTimestamp}`)))
+                Effect.andThen(Effect.logInfo(`Acknowledged commit with LSN ${PgReplicator.formatLSN(c.endLSN)} dated ${c.commitTimestamp}`)))
             ,
             Unknown: (u) =>
                 Effect.logDebug(`unhandled message type ${u.type}`),

@@ -1,5 +1,5 @@
 {
-  "name": "pgRepl",
+  "name": "pg-replicator",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
