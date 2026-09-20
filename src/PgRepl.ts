@@ -350,6 +350,7 @@ const decodePgOutput = Match.type<CopyData>().pipe(
 
 interface ReplicationConnection extends Connection {
     sendCopyFromChunk(chunk: Buffer): void
+    endCopyFrom(): void
 }
 
 
@@ -444,6 +445,14 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
                         })
                     )
 
+                    yield* Effect.addFinalizer(() =>
+                        Effect.gen(function* () {
+                            yield* sendStatus();
+                            (client.connection as ReplicationConnection).endCopyFrom()
+                        }).pipe(Effect.ignore))
+
+                    yield* Ref.set(lastAckedLSN, option.startLSN)
+
                     const mode = option.mode ? option.mode : "LOGICAL"
 
                     const sql = `START_REPLICATION SLOT ${option.slot} ${mode} ${formatLSN(option.startLSN)} (proto_version '${option.protoVersion}', publication_names '${option.publication}')`
@@ -451,11 +460,6 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
                     //not awaited
                     client.query(sql).catch((error) => Queue.failCauseUnsafe(queue, Cause.fail(new PgReplError({ message: `command failed : ${sql}`, cause: error }))))
 
-                    yield* Ref.set(lastAckedLSN, option.startLSN)
-                    // yield* sendStatus().pipe(
-                    //     Effect.repeat(Schedule.spaced("10 seconds")),
-                    //     Effect.forkScoped
-                    // )
                 })
             }).pipe(
                 Stream.mapEffect((chunk) =>
@@ -528,16 +532,31 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgRepl> => Effect.gen(f
     }
 })
 
+export type TextDecoder = (text: string) => unknown
+
+export const defaultDecoders: ReadonlyMap<number, TextDecoder> = new Map<number, TextDecoder>([
+    [16, (t) => t === "t"],           // bool
+    [21, Number],                     // int2
+    [23, Number],                     // int4
+    [20, BigInt],                     // int8
+    [700, Number],                     // float4
+    [701, Number],                     // float8
+    [1114, (t) => new Date(t + "Z")],   // timestamp (no tz, treat as UTC)
+    [1184, (t) => new Date(t)],         // timestamptz
+    [114, JSON.parse],                 // json
+    [3802, JSON.parse],                 // jsonb
+])
 
 const convertToRows = (relation: RelationData, tupleData: TupleData) => {
     const rows: Record<string, unknown> = {}
     relation.relationColumns.forEach((column, i) => {
         const tuple = tupleData.columns[i]
+        const decode = defaultDecoders.get(column.dataTypeOID) ?? (t => t)
 
         Column.$match(tuple, {
             Null: () => rows[column.name] = null,
             Toast: () => rows[column.name] = "(unchanged)",
-            Text: (t) => rows[column.name] = t.value,
+            Text: (t) => rows[column.name] = decode(t.value),
             Binary: (b) => rows[column.name] = b.value,
         })
     })
