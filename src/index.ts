@@ -11,6 +11,7 @@ export {
 } from "./pg-replicator"
 
 export {
+    ReplicationMessage,
     PgOutput,
     Column,
     type Keepalive,

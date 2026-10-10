@@ -2,7 +2,6 @@ import { Effect, Stream } from "effect"
 import pg from "pg"
 import * as PgReplicator from "../src"
 import { NodeRuntime } from "@effect/platform-node"
-import { ReplicationMessage } from "../src/message"
 import { pgTimeToDate } from "../src/utils"
 
 const connectionString = "postgres://postgres:postgres@localhost:5434/syncengine"
@@ -41,7 +40,7 @@ const RunReplication = Effect.fn(function* () {
         publication: publicationName,
         protoVersion: 2,
     }).pipe(
-        Stream.runForEach(ReplicationMessage.$match({
+        Stream.runForEach(PgReplicator.ReplicationMessage.$match({
             XLogData: (x) =>
                 Effect.logInfo(`XLOGDATA ${PgReplicator.formatLSN(x.serverWalStart)} dated ${pgTimeToDate(x.serverTime).toISOString()}`).pipe(
                     Effect.andThen(PgReplicator.PgOutput.$match(x.message, {

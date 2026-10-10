@@ -8,7 +8,7 @@ Consume your database's write-ahead log as an Effect `Stream` of typed `Begin` /
 
 ## Features
 
-- `Stream.Stream<PgOutput, PgReplError>` over a replication connection
+- `Stream.Stream<ReplicationMessage, PgReplError>` over a replication connection
 - Decodes `pgoutput` protocol messages: Begin, Commit, Relation, Insert, Update, Delete
 - Tracks `Relation` messages so Insert/Update/Delete arrive with column-named `rows` objects
 - Decodes common Postgres text types (`bool`, `int2/4/8`, `float4/8`, `timestamp[tz]`, `json[b]`) to JS values
@@ -89,16 +89,19 @@ const program = Effect.gen(function* () {
     })
     .pipe(
       Stream.runForEach(
-        PgReplicator.PgOutput.$match({
-          Begin: (b) => Effect.logInfo(`BEGIN xid=${b.xid}`),
-          Insert: (i) => Effect.logInfo(`INSERT ${JSON.stringify(i.rows)}`),
-          Update: (u) => Effect.logInfo(`UPDATE ${JSON.stringify(u.oldRows)} -> ${JSON.stringify(u.newRows)}`),
-          Delete: (d) => Effect.logInfo(`DELETE ${JSON.stringify(d.rows)}`),
-          // Acknowledge after each transaction so Postgres can recycle WAL.
-          Commit: (c) => repl.ack(c.endLSN),
-          Relation: () => Effect.void,
+        PgReplicator.ReplicationMessage.$match({
           Keepalive: () => Effect.void,
-          Unknown: (u) => Effect.logDebug(`unhandled message ${u.type}`),
+          XLogData: (x) =>
+            PgReplicator.PgOutput.$match(x.message, {
+              Begin: (b) => Effect.logInfo(`BEGIN xid=${b.xid} at ${PgReplicator.formatLSN(x.serverWalStart)}`),
+              Insert: (i) => Effect.logInfo(`INSERT ${JSON.stringify(i.rows)}`),
+              Update: (u) => Effect.logInfo(`UPDATE ${JSON.stringify(u.oldRows)} -> ${JSON.stringify(u.newRows)}`),
+              Delete: (d) => Effect.logInfo(`DELETE ${JSON.stringify(d.rows)}`),
+              // Acknowledge after each transaction so Postgres can recycle WAL.
+              Commit: (c) => repl.ack(c.endLSN),
+              Relation: () => Effect.void,
+              Unknown: (u) => Effect.logDebug(`unhandled message ${u.type}`),
+            }),
         }),
       ),
     )
@@ -121,7 +124,7 @@ Wraps an already-connected `pg.Client` that was created with `replication: "data
 interface PgReplicator {
   createReplicationSlot(option: CreateReplicationSlot): Effect<CreateReplicationSlotResult, PgReplError | SlotAlreadyExists>
   dropReplicationSlot(slotName: string): Effect<void, PgReplError>
-  startReplication(option: StartReplicationOption): Stream<PgOutput, PgReplError>
+  startReplication(option: StartReplicationOption): Stream<ReplicationMessage, PgReplError>
   ack(lsn: bigint): Effect<void, PgReplError>
 }
 ```
@@ -131,9 +134,18 @@ interface PgReplicator {
 - **`ack`** sends a standby status update telling the server everything up to `lsn` has been processed. Call it with `Commit.endLSN` once you've durably handled a transaction. Until you ack, Postgres retains WAL for the slot, so a consumer that never acks will fill the server's disk.
 - **`dropReplicationSlot`** runs `DROP_REPLICATION_SLOT`.
 
+### `ReplicationMessage`
+
+What `startReplication` emits. A `Data.TaggedEnum` with a `$match` helper. Variants:
+
+| Tag | Fields | Notes |
+|---|---|---|
+| `Keepalive` | `serverWalEnd: bigint`, `serverTime: Date`, `replyRequested: boolean` | Replies are sent for you. `serverWalEnd` is the server's current WAL flush position, useful for measuring lag |
+| `XLogData` | `serverWalStart: bigint`, `serverWalEnd: bigint`, `serverTime: bigint`, `message: PgOutput` | Envelope around one decoded `pgoutput` message. On `Begin`, `serverWalStart` is the LSN where the transaction starts. `serverTime` is microseconds since 2000-01-01 |
+
 ### `PgOutput`
 
-A `Data.TaggedEnum` with a `$match` helper. Variants:
+The decoded `pgoutput` message inside `XLogData.message`. A `Data.TaggedEnum` with a `$match` helper. Variants:
 
 | Tag | Fields | Notes |
 |---|---|---|
@@ -143,7 +155,6 @@ A `Data.TaggedEnum` with a `$match` helper. Variants:
 | `Insert` | `relationId`, `tupleData`, `rows?` | `rows` is `Record<columnName, value>` |
 | `Update` | `relationId`, `oldTupleKind?`, `oldTupleData?`, `newTupleData`, `oldRows?`, `newRows?` | `oldRows` present only when replica identity is `FULL` or the key changed |
 | `Delete` | `relationId`, `oldTupleKind?`, `oldTupleData?`, `rows?` | `rows` holds the key or the full old row depending on replica identity |
-| `Keepalive` | `serverWalEnd: bigint`, `serverTime: Date`, `replyRequested: boolean` | Replies are sent for you |
 | `Unknown` | `type: string`, `walData: Buffer` | Message types not decoded yet (Truncate, Type, Origin, Message, streaming) |
 
 `rows` are decoded from Postgres text values using `defaultDecoders` (keyed by type OID); unknown types are left as strings, `NULL` becomes `null`, unchanged TOAST values become `"(unchanged)"`.

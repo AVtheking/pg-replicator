@@ -1,6 +1,6 @@
 {
   "name": "pg-replicator",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Effect-native PostgreSQL logical replication client (pgoutput) built on node-postgres",
   "type": "module",
   "main": "./dist/index.js",
