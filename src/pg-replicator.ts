@@ -2,7 +2,7 @@ import { Cause, Effect, Queue, Stream, Match, Result, Ref } from "effect"
 import pg, { Connection } from "pg"
 import { PgReplError, SlotAlreadyExists } from "./errors"
 import { dateToPgTime } from "./utils"
-import { Column, decodeCopyData, decodePgOutput, formatLSN, parseLSN, PgOutput, RelationData, TupleData, } from "./message"
+import { Column, decodeCopyData, decodePgOutput, formatLSN, parseLSN, PgOutput, RelationData, ReplicationMessage, TupleData, } from "./message"
 
 export enum ReplicationMode {
     Logical = "LOGICAL",
@@ -11,7 +11,7 @@ export enum ReplicationMode {
 
 export interface CreateReplicationSlot {
     slotName: string
-    outputPlugin: string
+    outputPlugin: "pgoutput"
     options?: {
         temporary?: boolean
         mode?: ReplicationMode
@@ -83,7 +83,7 @@ interface ReplicationConnection extends Connection {
 
 export interface PgReplicator {
     createReplicationSlot(option: CreateReplicationSlot): Effect.Effect<CreateReplicationSlotResult, PgReplError | SlotAlreadyExists, never>
-    startReplication(option: StartReplicationOption): Stream.Stream<PgOutput, PgReplError>
+    startReplication(option: StartReplicationOption): Stream.Stream<ReplicationMessage, PgReplError>
     dropReplicationSlot(slotName: string): Effect.Effect<void, PgReplError, never>
     ack(lsn: bigint): Effect.Effect<void, PgReplError, never>
 }
@@ -196,54 +196,66 @@ export const fromPg = (client: pg.Client): Effect.Effect<PgReplicator> => Effect
                             }
                             return Effect.void
                         }),
-                        Match.tag("Unknown", (u) => {
-                            return Effect.logInfo(`Not implemented this byte: ${u.type}`)
-                        }),
+                        Match.tag("XLogData", (x) =>
+                            x.message._tag === "Unknown"
+                                ? Effect.logInfo(`Not implemented this byte: ${x.message.type}`)
+                                : Effect.void
+                        ),
                         Match.orElse(() => Effect.void)
                     )
                 ),
                 Stream.mapAccum(
                     (): Map<number, RelationData> => new Map(),
-                    (relations, msg): readonly [Map<number, RelationData>, ReadonlyArray<PgOutput>] => {
-                        return Match.value(msg).pipe(
-                            Match.withReturnType<readonly [Map<number, RelationData>, ReadonlyArray<PgOutput>]>(),
-                            Match.tag("Relation", (relation) => {
-                                relations.set(relation.relationId, relation)
-                                return [relations, [relation]]
+                    (relations, msg): readonly [Map<number, RelationData>, ReadonlyArray<ReplicationMessage>] =>
+                        Match.value(msg).pipe(
+                            Match.withReturnType<readonly [Map<number, RelationData>, ReadonlyArray<ReplicationMessage>]>(),
+                            Match.tag("Keepalive", () => [relations, [msg]] as const),
+                            Match.tag("XLogData", (x) => {
+                                const inner = Match.value(x.message).pipe(
+                                    Match.withReturnType<PgOutput | undefined>(),
+                                    Match.tag("Relation", (relation) => {
+                                        relations.set(relation.relationId, relation)
+                                        return relation
+                                    }),
+                                    Match.tag("Insert", (insert) => {
+                                        const relation = relations.get(insert.relationId)
+                                        if (!relation) return undefined
+
+                                        const rows = convertToRows(relation, insert.tupleData)
+                                        return PgOutput.Insert({ ...insert, rows })
+                                    }),
+                                    Match.tag("Update", (update) => {
+                                        const relation = relations.get(update.relationId)
+
+                                        if (!relation) return undefined
+
+                                        let oldRows: Record<string, unknown> | undefined
+                                        if (update.oldTupleData) {
+                                            oldRows = convertToRows(relation, update.oldTupleData)
+                                        }
+                                        const newRows = convertToRows(relation, update.newTupleData)
+                                        return PgOutput.Update({ ...update, oldRows, newRows })
+                                    }),
+                                    Match.tag("Delete", (del) => {
+                                        const relation = relations.get(del.relationId)
+
+                                        if (!relation) return undefined
+                                        let oldRows: Record<string, unknown> | undefined
+
+                                        if (del.oldTupleData) {
+                                            oldRows = convertToRows(relation, del.oldTupleData)
+                                        }
+                                        return PgOutput.Delete({ ...del, rows: oldRows })
+                                    }),
+                                    Match.orElse((m) => m)
+                                )
+                                return inner
+                                    ? [relations, [ReplicationMessage.XLogData({ ...x, message: inner })]]
+                                    : [relations, []]
                             }),
-                            Match.tag("Insert", (insert) => {
-                                const relation = relations.get(insert.relationId)
-                                if (!relation) return [relations, []]
-
-                                const rows = convertToRows(relation, insert.tupleData)
-                                return [relations, [PgOutput.Insert({ ...insert, rows })]]
-                            }),
-                            Match.tag("Update", (update) => {
-                                const relation = relations.get(update.relationId)
-
-                                if (!relation) return [relations, []]
-
-                                let oldRows: Record<string, unknown> | undefined
-                                if (update.oldTupleData) {
-                                    oldRows = convertToRows(relation, update.oldTupleData)
-                                }
-                                const newRows = convertToRows(relation, update.newTupleData)
-                                return [relations, [PgOutput.Update({ ...update, oldRows, newRows })]]
-                            }),
-                            Match.tag("Delete", (del) => {
-                                const relation = relations.get(del.relationId)
-
-                                if (!relation) return [relations, []]
-                                let oldRows: Record<string, unknown> | undefined
-
-                                if (del.oldTupleData) {
-                                    oldRows = convertToRows(relation, del.oldTupleData)
-                                }
-                                return [relations, [PgOutput.Delete({ ...del, rows: oldRows })]]
-                            }),
-                            Match.orElse(() => [relations, [msg]])
+                            Match.exhaustive
                         )
-                    })
+                )
             )
     }
 })

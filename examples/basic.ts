@@ -2,6 +2,8 @@ import { Effect, Stream } from "effect"
 import pg from "pg"
 import * as PgReplicator from "../src"
 import { NodeRuntime } from "@effect/platform-node"
+import { ReplicationMessage } from "../src/message"
+import { pgTimeToDate } from "../src/utils"
 
 const connectionString = "postgres://postgres:postgres@localhost:5434/syncengine"
 const slotName = "my_slot"
@@ -39,38 +41,43 @@ const RunReplication = Effect.fn(function* () {
         publication: publicationName,
         protoVersion: 2,
     }).pipe(
-        Stream.runForEach(PgReplicator.PgOutput.$match({
+        Stream.runForEach(ReplicationMessage.$match({
+            XLogData: (x) =>
+                Effect.logInfo(`XLOGDATA ${PgReplicator.formatLSN(x.serverWalStart)} dated ${pgTimeToDate(x.serverTime).toISOString()}`).pipe(
+                    Effect.andThen(PgReplicator.PgOutput.$match(x.message, {
+                        Begin: (b) =>
+                            Effect.logInfo(`BEGIN ${PgReplicator.formatLSN(x.serverWalStart)} final ${PgReplicator.formatLSN(b.finalLSN)} xid ${b.xid}`),
+                        Relation: (r) => {
+                            const header = `| Name           | Data Type OID |\n| -------------- | ------------- |`
+                            const rows = r.relationColumns.map(c =>
+                                `| ${c.name.padEnd(14)} | ${c.dataTypeOID.toString().padEnd(13)} |`
+                            )
+                            const table = [header, ...rows].join("\n")
+                            return Effect.logInfo(
+                                [
+                                    `RELATION`,
+                                    `Relation ID: ${r.relationId}`,
+                                    `Namespace: ${r.namespace}`,
+                                    `Name: ${r.name}`,
+                                    `Replica Identity: ${r.replicaIdentity}`,
+                                    `Number of Columns: ${r.numberOfColumns}`,
+                                    table
+                                ].join("\n")
+                            )
+                        },
+                        Insert: (i) => Effect.logInfo(`INSERT  ${JSON.stringify(i.rows)}`),
+                        Update: (u) => Effect.logInfo(`UPDATE  ${JSON.stringify(u.oldRows)} ${JSON.stringify(u.newRows)}`),
+                        Delete: (d) => Effect.logInfo(`DELETE  ${JSON.stringify(d.rows)}`),
+                        Commit: (c) => repl.ack(c.endLSN).pipe(
+                            Effect.andThen(Effect.logInfo(`Acknowledged commit with LSN ${PgReplicator.formatLSN(c.endLSN)} dated ${c.commitTimestamp.toISOString()}`))),
+                        Unknown: (u) =>
+                            Effect.logDebug(`unhandled message type ${u.type}`),
+                    }))
+                ),
             Keepalive: (k) =>
                 Effect.logInfo(`keepalive ${PgReplicator.formatLSN(k.serverWalEnd)} dated ${k.serverTime.toISOString()} replyRequested: ${k.replyRequested}`),
-            Begin: (b) =>
-                Effect.logInfo(`BEGIN ${b.finalLSN} ${b.commitTimestamp} ${b.xid}`),
-            Relation: (r) => {
-                const header = `| Name           | Data Type OID |\n| -------------- | ------------- |`
-                const rows = r.relationColumns.map(c =>
-                    `| ${c.name.padEnd(14)} | ${c.dataTypeOID.toString().padEnd(13)} |`
-                )
-                const table = [header, ...rows].join("\n")
-                return Effect.logInfo(
-                    [
-                        `RELATION`,
-                        `Relation ID: ${r.relationId}`,
-                        `Namespace: ${r.namespace}`,
-                        `Name: ${r.name}`,
-                        `Replica Identity: ${r.replicaIdentity}`,
-                        `Number of Columns: ${r.numberOfColumns}`,
-                        table
-                    ].join("\n")
-                )
-            },
-            Insert: (i) => Effect.logInfo(`INSERT  ${JSON.stringify(i.rows)}`),
-            Update: (u) => Effect.logInfo(`UPDATE  ${JSON.stringify(u.oldRows)} ${JSON.stringify(u.newRows)}`),
-            Delete: (d) => Effect.logInfo(`DELETE  ${JSON.stringify(d.rows)}`),
-            Commit: (c) => repl.ack(c.endLSN).pipe(
-                Effect.andThen(Effect.logInfo(`Acknowledged commit with LSN ${PgReplicator.formatLSN(c.endLSN)} dated ${c.commitTimestamp}`)))
-            ,
-            Unknown: (u) =>
-                Effect.logDebug(`unhandled message type ${u.type}`),
         }))
+
     )
 })
 

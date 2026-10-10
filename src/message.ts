@@ -6,21 +6,22 @@ export enum CopyDataCode {
     Keepalive = "k",
     XLogData = "w",
 }
-
 export interface Keepalive {
     serverWalEnd: bigint
     serverTime: Date
     replyRequested: boolean
 }
 
+export interface XLogData {
+    serverWalStart: bigint
+    serverWalEnd: bigint
+    serverTime: bigint
+    walData: Buffer
+}
+
 export type CopyData = Data.TaggedEnum<{
     Keepalive: Keepalive
-    XLogData: {
-        serverWalStart: bigint
-        serverWalEnd: bigint
-        serverTime: bigint
-        walData: Buffer
-    }
+    XLogData: XLogData
 }>
 
 export const CopyData = Data.taggedEnum<CopyData>()
@@ -56,7 +57,6 @@ export type RelationData = {
 }
 
 export type PgOutput = Data.TaggedEnum<{
-    Keepalive: Keepalive
     Begin: {
         finalLSN: bigint
         commitTimestamp: bigint
@@ -72,7 +72,7 @@ export type PgOutput = Data.TaggedEnum<{
     Insert: {
         relationId: number
         tupleData: TupleData
-        rows?: Record<string, unknown>
+        rows: Record<string, unknown>
     }
     Update: {
         xid?: number
@@ -97,6 +97,18 @@ export type PgOutput = Data.TaggedEnum<{
 }>
 
 export const PgOutput = Data.taggedEnum<PgOutput>()
+
+export type ReplicationMessage = Data.TaggedEnum<{
+    Keepalive: Keepalive
+    XLogData: {
+        serverWalStart: bigint
+        serverWalEnd: bigint
+        serverTime: bigint
+        message: PgOutput
+    }
+}>
+
+export const ReplicationMessage = Data.taggedEnum<ReplicationMessage>()
 
 export enum MessageType {
     Relation = "R",
@@ -218,6 +230,7 @@ const decodeWalData = (walData: Buffer): Result.Result<PgOutput, PgReplError> =>
                 PgOutput.Insert({
                     relationId: walData.readUInt32BE(1),
                     tupleData: tupleData.tupleData,
+                    rows: {},
                 }))
         case MessageType.Update: {
             const relationId = walData.readUInt32BE(1)
@@ -273,14 +286,20 @@ const decodeWalData = (walData: Buffer): Result.Result<PgOutput, PgReplError> =>
 }
 
 export const decodePgOutput = Match.type<CopyData>().pipe(
-    Match.withReturnType<Result.Result<PgOutput, PgReplError>>(),
+    Match.withReturnType<Result.Result<ReplicationMessage, PgReplError>>(),
     Match.tag("Keepalive", (k) =>
-        Result.succeed(PgOutput.Keepalive({
+        Result.succeed(ReplicationMessage.Keepalive({
             serverWalEnd: k.serverWalEnd,
             serverTime: k.serverTime,
             replyRequested: k.replyRequested,
         }))),
-    Match.tag("XLogData", (x) => decodeWalData(x.walData)),
+    Match.tag("XLogData", (x) => Result.map(decodeWalData(x.walData), (message) =>
+        ReplicationMessage.XLogData({
+            serverWalStart: x.serverWalStart,
+            serverWalEnd: x.serverWalEnd,
+            serverTime: x.serverTime,
+            message,
+        }))),
     Match.exhaustive,
 )
 
